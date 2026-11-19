@@ -1,0 +1,148 @@
+#include "protect.h"
+#include "aes.h"
+#include "sha2.h"
+#include <cstring>
+#include <string.h>  // memset_s on macOS (Darwin declares it unconditionally)
+#include <functional>
+#include <stdexcept>
+#include <mbedtls/version.h>   // MBEDTLS_VERSION_MAJOR
+#if MBEDTLS_VERSION_MAJOR >= 4
+#  include <psa/crypto.h>      // 4.x: RNG via PSA (ctr_drbg/entropy setup removed)
+#else
+#  include <mbedtls/ctr_drbg.h>
+#  include <mbedtls/entropy.h>
+#endif
+#ifdef _WIN32
+#  include <windows.h>
+#else
+#  include <unistd.h>
+#endif
+
+// Single definition for the global in-memory-encryption state declared
+// `extern` in protect.h. Must be defined exactly once, in exactly one
+// translation unit — having this as `static` in the header (the old way)
+// gave every .cpp file its own private copy, silently breaking decryption
+// whenever SecureString::set() and SecureString::get() were called from
+// different .cpp files.
+
+std::string (*g_machine_id_fn)() = nullptr;
+std::string g_passphrase;
+
+static const int MEM_IV_LEN  = 12;
+static const int MEM_TAG_LEN = 16;
+
+void secure_random(uint8_t* buf, size_t len) {
+    if (len == 0) return;
+#if MBEDTLS_VERSION_MAJOR >= 4
+    // 4.x: the explicit entropy + CTR_DRBG setup is gone — PSA owns the RNG.
+    static const psa_status_t initrc = psa_crypto_init();   // idempotent, once
+    (void)initrc;
+    if (psa_generate_random(buf, len) != PSA_SUCCESS)
+        throw std::runtime_error("secure_random: RNG draw failed");
+#else
+    // Lazily seed one process-wide CTR_DRBG from the platform entropy source.
+    static mbedtls_entropy_context  entropy;
+    static mbedtls_ctr_drbg_context ctr;
+    static const bool seeded = [] {
+        mbedtls_entropy_init(&entropy);
+        mbedtls_ctr_drbg_init(&ctr);
+        static const char pers[] = "ipatool-rng";
+        if (mbedtls_ctr_drbg_seed(&ctr, mbedtls_entropy_func, &entropy,
+                                  reinterpret_cast<const unsigned char*>(pers),
+                                  sizeof(pers) - 1) != 0)
+            throw std::runtime_error("secure_random: RNG seed failed");
+        return true;
+    }();
+    (void)seeded;
+    if (mbedtls_ctr_drbg_random(&ctr, buf, len) != 0)
+        throw std::runtime_error("secure_random: RNG draw failed");
+#endif
+}
+
+void secure_zero(void* ptr, size_t len) {
+    if (!ptr || len == 0) return;
+#ifdef _WIN32
+    SecureZeroMemory(ptr, len);
+#elif defined(__APPLE__)
+    memset_s(ptr, len, 0, len);
+#else
+    explicit_bzero(ptr, len);
+#endif
+}
+
+void init_mem_passphrase(const std::string& passphrase) {
+    g_passphrase = passphrase;
+}
+
+void wipe_mem_passphrase() {
+    if (!g_passphrase.empty())
+        secure_zero(g_passphrase.data(), g_passphrase.size());
+    g_passphrase.clear();
+}
+
+// Derive a fresh 32-byte mem key each call, use it, wipe immediately.
+static void with_mem_key(const std::function<void(const unsigned char*)>& fn) {
+    static const char* MEM_KEY_SALT = "nice_key_is_nice";
+    // Recompute machine_id fresh via function pointer — never cached
+    std::string machine_id = g_machine_id_fn ? g_machine_id_fn() : "";
+    std::string input = machine_id + MEM_KEY_SALT + g_passphrase;
+    secure_zero(machine_id.data(), machine_id.size());
+    unsigned char key[32];
+    Bytes k = sha2::digest(input);           // SHA-256 → 32-byte key
+    memcpy(key, k.data(), sizeof(key));
+    secure_zero(k.data(), k.size());
+    secure_zero(input.data(), input.size());
+    fn(key);
+    secure_zero(key, sizeof(key));
+}
+
+static std::vector<unsigned char> mem_encrypt(const std::string& plaintext) {
+    Bytes iv(MEM_IV_LEN);
+    secure_random(iv.data(), MEM_IV_LEN);
+    Bytes pt(plaintext.begin(), plaintext.end());
+
+    aes::GcmOutput result;
+    with_mem_key([&](const unsigned char* key) {
+        Bytes key_bytes(key, key + 32);
+        result = aes::gcm_encrypt(key_bytes, iv, pt);
+    });
+
+    std::vector<unsigned char> out;
+    out.insert(out.end(), iv.begin(), iv.end());
+    out.insert(out.end(), result.tag.begin(), result.tag.end());
+    out.insert(out.end(), result.ciphertext.begin(), result.ciphertext.end());
+    return out;
+}
+
+static std::string mem_decrypt(const std::vector<unsigned char>& blob) {
+    if (blob.size() < (size_t)(MEM_IV_LEN + MEM_TAG_LEN))
+        throw std::runtime_error("mem_decrypt: blob too short");
+    Bytes iv(blob.begin(), blob.begin() + MEM_IV_LEN);
+    Bytes tag(blob.begin() + MEM_IV_LEN, blob.begin() + MEM_IV_LEN + MEM_TAG_LEN);
+    Bytes ct(blob.begin() + MEM_IV_LEN + MEM_TAG_LEN, blob.end());
+
+    Bytes plain;
+    bool ok = false;
+    with_mem_key([&](const unsigned char* key) {
+        Bytes key_bytes(key, key + 32);
+        try {
+            plain = aes::gcm_decrypt(key_bytes, iv, ct, tag);
+            ok = true;
+        } catch (const std::exception&) {
+            ok = false;
+        }
+    });
+
+    if (!ok) throw std::runtime_error("mem_decrypt: authentication failed");
+    return std::string(plain.begin(), plain.end());
+}
+
+void SecureString::set(const std::string& s) {
+    if (s.empty()) { blob.clear(); return; }
+    blob = mem_encrypt(s);
+}
+
+std::string SecureString::get() const {
+    if (blob.empty()) return "";
+    return mem_decrypt(blob);
+}
