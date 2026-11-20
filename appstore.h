@@ -245,6 +245,26 @@ private:
     //   POST finishMachineProvisioning {cpim} → ptm + X-Apple-I-MD-RINFO
     //   AdiEndProvisioning(session, settingInfo, transportKey); adi_save()
     void gsa_provision_machine(uint64_t dsid);
+
+    // ── GSA / anisette (DSID -2) identity + transport ────────────────────────
+    // Dedicated transport for gsa.apple.com / MidService: it carries the embedded
+    // Apple CA blob (those hosts may chain to a root Windows lacks), while m_http
+    // keeps the system store so store-API hosts on public CAs and CDN downloads
+    // still verify.
+    HttpClient  m_gsaHttp;
+    bool        m_gsaHttpReady = false;
+    HttpClient& gsa_http();                  // lazy: install Apple CA + debug, once
+
+    // Software identity (majd/akd parity). Everything the GSA/Mid flow sends —
+    // X-Mme-Device-Id and X-Apple-I-MD-LU — derives from one persisted 16-byte
+    // seed, so provisioning and every later login present a single coherent
+    // machine. RINFO is captured at provisioning and persisted beside the seed.
+    std::vector<uint8_t> m_gsaIdentifier;
+    uint64_t    m_gsaRinfo = 0;
+    std::string gsa_identity_path() const;   // sidecar next to the ADI state
+    void        gsa_load_identity();         // load-or-create seed (+ rinfo)
+    void        gsa_save_identity() const;   // persist seed + rinfo
+
     // Lazy FairPlayGlobalContextInit on m_adi — the slow part (~15-20 s under
     // Unicorn). Only kbsync and the keybag import need the context; OTP
     // generation (X-Apple-MD headers) and erase do not, so they never pay for it.

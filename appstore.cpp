@@ -1,7 +1,13 @@
 #include "appstore.h"
-#include "SapSigner.h"   // SAP signing (v2.4.0+)
+#include "SapSigner.h"   // SAP signing (v2.4.0+) + SapBase64
 #include "device_mac.h"  // device MAC / GUID
 #include "StoreAgentMachine.h"
+#include "plist.h"       // PlistValue / encode_plist_xml / decode_plist / base64_*
+#include "sha2.h"        // sha2::digest — GSA identity LU
+#include "protect.h"     // secure_random — GSA identity seed
+#include "apple_ca.h"    // APPLE_GSA_CA_BUNDLE — gsa.apple.com trust anchor
+#include <span>
+#include <utility>
 #include <thread>
 #include <chrono>
 #include <fstream>
@@ -3512,23 +3518,196 @@ std::string AppStore::str_lower(const char* s) {
 // GSA machine DSID (-2). Store anon provisioning uses kAnonAdiDSID (-1).
 static constexpr uint64_t kGsaMachineDSID = ~uint64_t(1);
 
-AnisetteData AppStore::gsa_anisette() {
-    // TODO:
-    //   int32_t st = 0;
-    //   auto otp = adi_machine().AdiRequestOTP(kGsaMachineDSID, &st);
-    //   if (!otp) { gsa_provision_machine(kGsaMachineDSID);
-    //               otp = adi_machine().AdiRequestOTP(kGsaMachineDSID, &st); }
-    //   if (!otp) throw IpaError("GSA anisette: machine not provisioned");
-    //   Fill AnisetteData: otp=b64(otp->otp), machineID=b64(otp->machineID),
-    //   routingInfo (from provisioning), localUserUUID=hex(sha2::digest(identifier)),
-    //   deviceID, clientInfo (Mac, from emulated assets), serialNo, clientTime, locale, tz.
-    throw IpaError("gsa_anisette: not implemented yet");
+namespace {
+// ── Mac software-anisette identity (majd / akd parity) ───────────────────────
+// Every value derives from one persisted 16-byte seed, so provisioning and each
+// later GSA call present a single coherent machine.
+constexpr const char* MID_START_URL =
+    "https://gsa.apple.com/grandslam/MidService/startMachineProvisioning";
+constexpr const char* MID_FINISH_URL =
+    "https://gsa.apple.com/grandslam/MidService/finishMachineProvisioning";
+constexpr const char* ANISETTE_CLIENT_INFO =
+    "<MacBookPro13,3> <Mac OS X;10.12.6;16G29> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+constexpr const char* ANISETTE_UA =
+    "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0";
+
+std::string gsa_to_hex(const std::vector<uint8_t>& b) {
+    static const char* h = "0123456789abcdef";
+    std::string s; s.reserve(b.size() * 2);
+    for (uint8_t c : b) { s.push_back(h[c >> 4]); s.push_back(h[c & 0x0F]); }
+    return s;
 }
 
-void AppStore::gsa_provision_machine(uint64_t /*dsid*/) {
-    // TODO: MidService start → spim → AdiStartProvisioning → finish {cpim} →
-    //       ptm + RINFO → AdiEndProvisioning → adi_save(). Uses m_http (+CA blob).
-    throw IpaError("gsa_provision_machine: not implemented yet");
+// X-Apple-I-MD-LU = hex(sha256(seed)); X-Mme-Device-Id = hex(seed) laid out as a UUID.
+std::pair<std::string, std::string> gsa_identity(const std::vector<uint8_t>& seed) {
+    const std::string lu = gsa_to_hex(sha2::digest(seed));
+    const std::string hx = gsa_to_hex(seed);            // 32 hex of the 16-byte seed
+    const std::string dev = hx.substr(0, 8) + "-" + hx.substr(8, 4) + "-" +
+                            hx.substr(12, 4) + "-" + hx.substr(16, 4) + "-" + hx.substr(20, 12);
+    return { lu, dev };
+}
+
+// MidService envelope: empty Header, Request = values (XML plist).
+std::string mid_body(const PlistDict& request) {
+    PlistDict root;
+    root["Header"]  = PlistValue::makeDict(PlistDict{});
+    root["Request"] = PlistValue::makeDict(request);
+    return encode_plist_xml(root);
+}
+
+// Provisioning headers: identity only — NO X-Apple-I-MD/-M (they don't exist
+// until the machine is provisioned; that's the chicken-and-egg the bag/lookup
+// and this step resolve).
+std::map<std::string, std::string> mid_headers(const std::string& lu, const std::string& dev) {
+    return {
+        {"Accept",            "*/*"},
+        {"Connection",        "close"},
+        {"Content-Type",      "text/x-xml-plist"},
+        {"User-Agent",        ANISETTE_UA},
+        {"X-Apple-I-MD-LU",   lu},
+        {"X-MMe-Client-Info", ANISETTE_CLIENT_INFO},
+        {"X-Mme-Device-Id",   dev},
+    };
+}
+
+PlistDict mid_response(const std::string& body) {
+    PlistDict d = decode_plist(body);
+    if (d.count("Response") && d.at("Response").isDict()) return d.at("Response").dictVal;
+    return d;
+}
+} // namespace
+
+HttpClient& AppStore::gsa_http() {
+    if (!m_gsaHttpReady) {
+        m_gsaHttp.set_ca_bundle(std::string(APPLE_GSA_CA_BUNDLE, APPLE_GSA_CA_BUNDLE_LEN));
+        m_gsaHttp.set_debug(m_debug);
+        m_gsaHttpReady = true;
+    }
+    return m_gsaHttp;
+}
+
+std::string AppStore::gsa_identity_path() const {
+    return m_adiStatePath.empty() ? std::string() : (m_adiStatePath + ".gsaid");
+}
+
+void AppStore::gsa_load_identity() {
+    if (m_gsaIdentifier.size() == 16) return;   // already in memory
+
+    const std::string path = gsa_identity_path();
+    if (!path.empty()) {
+        std::ifstream in(ipt::fs_path(path));
+        if (in) {
+            std::string idhex;
+            uint64_t    rinfo = 0;
+            std::getline(in, idhex);
+            in >> rinfo;
+            if (idhex.size() == 32) {
+                auto hv = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    return -1;
+                };
+                std::vector<uint8_t> id(16);
+                bool ok = true;
+                for (size_t i = 0; i < 16 && ok; ++i) {
+                    int hi = hv(idhex[i * 2]), lo = hv(idhex[i * 2 + 1]);
+                    if (hi < 0 || lo < 0) { ok = false; break; }
+                    id[i] = static_cast<uint8_t>((hi << 4) | lo);
+                }
+                if (ok) {
+                    m_gsaIdentifier = std::move(id);
+                    m_gsaRinfo      = rinfo;
+                    prov_log("GSA identity loaded (rinfo=" + std::to_string(rinfo) + ")");
+                    return;
+                }
+            }
+        }
+    }
+
+    m_gsaIdentifier.resize(16);
+    secure_random(m_gsaIdentifier.data(), m_gsaIdentifier.size());
+    m_gsaRinfo = 0;
+    prov_log("GSA identity generated (new machine)");
+    gsa_save_identity();
+}
+
+void AppStore::gsa_save_identity() const {
+    const std::string path = gsa_identity_path();
+    if (path.empty() || m_gsaIdentifier.size() != 16) return;
+    std::ofstream out(ipt::fs_path(path), std::ios::trunc);
+    if (!out) { return; }
+    out << gsa_to_hex(m_gsaIdentifier) << "\n" << m_gsaRinfo << "\n";
+}
+
+AnisetteData AppStore::gsa_anisette() {
+    gsa_load_identity();
+
+    int32_t st = 0;
+    auto otp = adi_machine().AdiRequestOTP(kGsaMachineDSID, &st);
+    if (!otp || m_gsaRinfo == 0) {              // unprovisioned, or RINFO lost
+        gsa_provision_machine(kGsaMachineDSID);
+        otp = adi_machine().AdiRequestOTP(kGsaMachineDSID, &st);
+    }
+    if (!otp)
+        throw IpaError("GSA anisette: OTP unavailable (status " + std::to_string(st) + ")");
+    adi_save();   // the OTP counter lives in the ADI state
+
+    auto [lu, dev] = gsa_identity(m_gsaIdentifier);
+    AnisetteData a;
+    a.otp           = SapBase64::Encode(otp->otp);
+    a.machineID     = SapBase64::Encode(otp->machineID);
+    a.localUserUUID = lu;
+    a.routingInfo   = std::to_string(m_gsaRinfo);
+    a.deviceID      = dev;
+    a.clientInfo    = ANISETTE_CLIENT_INFO;
+    a.serialNo      = "0";          // majd/akd parity — no real serial for software anisette
+    a.clientTime    = "";           // GsaClient stamps ISO-8601 when empty
+    a.locale        = "en_US";
+    a.timezone      = "UTC";
+    return a;
+}
+
+void AppStore::gsa_provision_machine(uint64_t dsid) {
+    gsa_load_identity();
+    auto [lu, dev]   = gsa_identity(m_gsaIdentifier);
+    HttpClient& http = gsa_http();
+
+    // start → spim
+    prov_log("GSA MidService: start provisioning DSID " + dsid_str(dsid));
+    HttpResponse r1 = http.post(MID_START_URL, mid_body(PlistDict{}), mid_headers(lu, dev));
+    if (r1.statusCode != 200)
+        throw IpaError("GSA provisioning start: HTTP " + std::to_string(r1.statusCode));
+    PlistDict resp1 = mid_response(r1.body);
+    std::vector<uint8_t> spim = base64_decode(dict_str(resp1, "spim"));
+    if (spim.empty()) throw IpaError("GSA provisioning: missing spim");
+
+    // ADI consumes spim, produces cpim + a session handle
+    auto sr = adi_machine().AdiStartProvisioning(dsid, spim);
+
+    // finish {cpim} → ptm + tk + RINFO
+    PlistDict finReq;
+    finReq["cpim"] = PlistValue::makeString(
+        base64_encode(sr.clientData.data(), sr.clientData.size()));
+    prov_log("GSA MidService: finish provisioning");
+    HttpResponse r2 = http.post(MID_FINISH_URL, mid_body(finReq), mid_headers(lu, dev));
+    if (r2.statusCode != 200)
+        throw IpaError("GSA provisioning finish: HTTP " + std::to_string(r2.statusCode));
+    PlistDict resp2 = mid_response(r2.body);
+
+    std::vector<uint8_t> ptm = base64_decode(dict_str(resp2, "ptm"));
+    std::vector<uint8_t> tk  = base64_decode(dict_str(resp2, "tk"));
+    if (ptm.empty() || tk.empty()) throw IpaError("GSA provisioning: missing ptm/tk");
+
+    // RINFO is in the Response body (not a header)
+    try { m_gsaRinfo = std::stoull(dict_str(resp2, "X-Apple-I-MD-RINFO")); }
+    catch (...) { m_gsaRinfo = 0; }
+    if (m_gsaRinfo == 0) throw IpaError("GSA provisioning: bad routing info");
+
+    adi_machine().AdiEndProvisioning(sr.session, ptm, tk);
+    gsa_save_identity();   // persist RINFO beside the seed
+    adi_save();            // persist the ADI state — now carries DSID -2
+    prov_log("GSA provisioning complete (rinfo=" + std::to_string(m_gsaRinfo) + ")");
 }
 
 Account AppStore::login_gsa(const std::string& /*email*/,
