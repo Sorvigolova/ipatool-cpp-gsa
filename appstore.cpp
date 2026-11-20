@@ -3689,8 +3689,12 @@ void AppStore::gsa_provision_machine(uint64_t dsid) {
 
     // start → spim
     prov_log("GSA MidService: start provisioning DSID " + dsid_str(dsid));
-    HttpResponse r1 = http.post(gsa_bag("midStartProvisioning", MID_START_URL),
-                                mid_body(PlistDict{}), mid_headers(lu, dev));
+    const std::string startUrl  = gsa_bag("midStartProvisioning", MID_START_URL);
+    const std::string startBody = mid_body(PlistDict{});
+    const auto        startHdrs = mid_headers(lu, dev);
+    if (m_debug) debug_dump_request("GSA MidService start", "POST", startUrl, startHdrs, startBody);
+    HttpResponse r1 = http.post(startUrl, startBody, startHdrs);
+    if (m_debug) debug_dump_response("GSA MidService start", r1);
     if (r1.statusCode != 200)
         throw IpaError("GSA provisioning start: HTTP " + std::to_string(r1.statusCode));
     PlistDict resp1 = mid_response(r1.body);
@@ -3705,8 +3709,12 @@ void AppStore::gsa_provision_machine(uint64_t dsid) {
     finReq["cpim"] = PlistValue::makeString(
         base64_encode(sr.clientData.data(), sr.clientData.size()));
     prov_log("GSA MidService: finish provisioning");
-    HttpResponse r2 = http.post(gsa_bag("midFinishProvisioning", MID_FINISH_URL),
-                                mid_body(finReq), mid_headers(lu, dev));
+    const std::string finUrl  = gsa_bag("midFinishProvisioning", MID_FINISH_URL);
+    const std::string finBody = mid_body(finReq);
+    const auto        finHdrs = mid_headers(lu, dev);
+    if (m_debug) debug_dump_request("GSA MidService finish", "POST", finUrl, finHdrs, finBody);
+    HttpResponse r2 = http.post(finUrl, finBody, finHdrs);
+    if (m_debug) debug_dump_response("GSA MidService finish", r2);
     if (r2.statusCode != 200)
         throw IpaError("GSA provisioning finish: HTTP " + std::to_string(r2.statusCode));
     PlistDict resp2 = mid_response(r2.body);
@@ -3762,8 +3770,9 @@ void AppStore::gsa_post_data(const std::string& hbToken) {
             {"X-Mme-Country",      "US"},
         };
         const std::string url = gsa_bag("postData", POSTDATA_URL_FALLBACK);
+        if (m_debug) debug_dump_request("GSA postData", "POST", url, h, body);
         HttpResponse r = gsa_http().post(url, body, h);
-        if (m_debug) prov_log("GSA postData: HTTP " + std::to_string(r.statusCode));
+        if (m_debug) debug_dump_response("GSA postData", r);
     } catch (const std::exception& e) {
         if (m_debug) prov_log(std::string("GSA postData failed (ignored): ") + e.what());
     }

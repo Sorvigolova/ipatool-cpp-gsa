@@ -46,6 +46,28 @@ Bytes dict_data(const PlistDict& d, const string& key) {
     return it->second.data();
 }
 
+// --debug request/response traces (URL + headers + body), matching the auth
+// flow's dumps. GSA bodies carry SRP proofs (A2k/M1), not the plaintext password,
+// so nothing needs masking.
+void dbg_dump_req(const char* label, const char* method, const string& url,
+                  const std::map<string, string>& headers, const string& body = "") {
+    fprintf(stderr, "[gsa] -- %s request --\n[gsa] %s %s\n[gsa] headers:\n",
+            label, method, url.c_str());
+    for (const auto& kv : headers)
+        fprintf(stderr, "  %s: %s\n", kv.first.c_str(), kv.second.c_str());
+    if (!body.empty())
+        fprintf(stderr, "[gsa] body (%zu bytes):\n%s\n", body.size(), body.c_str());
+}
+
+void dbg_dump_resp(const char* label, const HttpResponse& r) {
+    fprintf(stderr, "[gsa] -- %s response --\n[gsa] status: %d\n[gsa] headers:\n",
+            label, r.statusCode);
+    for (const auto& kv : r.headers)
+        fprintf(stderr, "  %s: %s\n", kv.first.c_str(), kv.second.c_str());
+    fprintf(stderr, "[gsa] body (%zu bytes):\n%s\n",
+            r.body.size(), r.body.empty() ? "<empty>" : r.body.c_str());
+}
+
 string iso8601_now() {
     time_t now = std::time(nullptr);
     struct tm t{};
@@ -182,8 +204,9 @@ bool do_2fa_validate(const HttpClient& http, bool dbg, const string& validateUrl
                      const string& code, const AnisetteData& a) {
     auto hdrs = build_2fa_headers(a, dsid, idms);
     hdrs["security-code"] = code;
+    if (dbg) dbg_dump_req("GSA 2fa validate", "GET", validateUrl, hdrs);
     const HttpResponse r = http.get(validateUrl, hdrs);
-    if (dbg) fprintf(stderr, "[gsa] 2fa validate status=%d\n", r.statusCode);
+    if (dbg) dbg_dump_resp("GSA 2fa validate", r);
     if (r.statusCode != 200) return false;
     if (!r.body.empty()) {
         try {
@@ -216,9 +239,11 @@ std::map<std::string, std::string> gsa_fetch_bag(const HttpClient& http, bool de
         {"User-Agent", GSA_UA},
         {"Accept",     "*/*"},
     };
+    if (debug) dbg_dump_req("GSA bag lookup", "GET", GSA_LOOKUP, h);
     HttpResponse r;
     try { r = http.get(GSA_LOOKUP, h); }
     catch (...) { if (debug) fprintf(stderr, "[gsa] bag lookup: request failed\n"); return bag; }
+    if (debug) dbg_dump_resp("GSA bag lookup", r);
     if (r.statusCode != 200 || r.body.empty()) {
         if (debug) fprintf(stderr, "[gsa] bag lookup: HTTP %d\n", r.statusCode);
         return bag;
@@ -273,7 +298,10 @@ GsaClient::Result GsaClient::login(const std::string&  email,
     ri["u"]   = PlistValue::makeString(email);
     ri["o"]   = PlistValue::makeString("init");
 
-    const HttpResponse r1 = m_http.post(gsSvc, encode_plist_xml(wrap_request(ri)), hdrs);
+    const string initBody = encode_plist_xml(wrap_request(ri));
+    if (m_debug) dbg_dump_req("GSA init", "POST", gsSvc, hdrs, initBody);
+    const HttpResponse r1 = m_http.post(gsSvc, initBody, hdrs);
+    if (m_debug) dbg_dump_resp("GSA init", r1);
     if (r1.statusCode != 200) throw IpaError("GSA init: HTTP " + std::to_string(r1.statusCode));
     const PlistDict d1o = decode_plist(r1.body);
     check_status(d1o, "init");
@@ -298,7 +326,10 @@ GsaClient::Result GsaClient::login(const std::string&  email,
     rc["o"]   = PlistValue::makeString("complete");
     rc["u"]   = PlistValue::makeString(email);
 
-    const HttpResponse r2 = m_http.post(gsSvc, encode_plist_xml(wrap_request(rc)), hdrs);
+    const string completeBody = encode_plist_xml(wrap_request(rc));
+    if (m_debug) dbg_dump_req("GSA complete", "POST", gsSvc, hdrs, completeBody);
+    const HttpResponse r2 = m_http.post(gsSvc, completeBody, hdrs);
+    if (m_debug) dbg_dump_resp("GSA complete", r2);
     if (r2.statusCode != 200) throw IpaError("GSA complete: HTTP " + std::to_string(r2.statusCode));
     const PlistDict d2o = decode_plist(r2.body);
     check_status(d2o, "complete");
