@@ -25,6 +25,11 @@
 namespace {
 using std::string;
 
+// Bootstrap endpoint — the ONE URL that must stay hard-coded: the bag that
+// supplies every other GSA/Mid URL is fetched from here, so it can't come from
+// the bag itself. A bare GET (no anisette); see GsaClient::lookup_bag.
+constexpr const char* GSA_LOOKUP   = "https://gsa.apple.com/grandslam/GsService2/lookup";
+// Fallbacks used only when the bag fetch failed or lacks the key.
 constexpr const char* GSA_ENDPOINT = "https://gsa.apple.com/grandslam/GsService2";
 constexpr const char* GSA_VALIDATE = "https://gsa.apple.com/grandslam/GsService2/validate";
 constexpr const char* ITUNES_UA =
@@ -169,12 +174,12 @@ void check_status(const PlistDict& d, const char* step) {
 
 // 2FA validate: GET GsService2/validate with security-code. Apple returns HTTP
 // 200 even on error, so the body's ec must be checked.
-bool do_2fa_validate(const HttpClient& http, bool dbg,
+bool do_2fa_validate(const HttpClient& http, bool dbg, const string& validateUrl,
                      const string& dsid, const string& idms,
                      const string& code, const AnisetteData& a) {
     auto hdrs = build_2fa_headers(a, dsid, idms);
     hdrs["security-code"] = code;
-    const HttpResponse r = http.get(GSA_VALIDATE, hdrs);
+    const HttpResponse r = http.get(validateUrl, hdrs);
     if (dbg) fprintf(stderr, "[gsa] 2fa validate status=%d\n", r.statusCode);
     if (r.statusCode != 200) return false;
     if (!r.body.empty()) {
@@ -200,6 +205,42 @@ PlistDict response_of(const PlistDict& outer) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Bare GET of the GSA bag — UA only, NO anisette (see header). Best-effort:
+// any failure leaves m_bag empty and endpoint() falls back to the defaults.
+void GsaClient::lookup_bag() {
+    if (!m_bag.empty()) return;
+    std::map<string, string> h = {
+        {"User-Agent", ITUNES_UA},
+        {"Accept",     "*/*"},
+    };
+    HttpResponse r;
+    try { r = m_http.get(GSA_LOOKUP, h); }
+    catch (...) { if (m_debug) fprintf(stderr, "[gsa] bag lookup: request failed\n"); return; }
+    if (r.statusCode != 200 || r.body.empty()) {
+        if (m_debug) fprintf(stderr, "[gsa] bag lookup: HTTP %d\n", r.statusCode);
+        return;
+    }
+    try {
+        const PlistDict root = response_of(decode_plist(r.body));
+        const PlistDict urls = dict_dict(root, "urls");
+        for (const auto& kv : urls)
+            if (kv.second.isString() && !kv.second.str().empty())
+                m_bag[kv.first] = kv.second.str();
+    } catch (...) {
+        if (m_debug) fprintf(stderr, "[gsa] bag lookup: parse failed\n");
+        m_bag.clear();
+        return;
+    }
+    if (m_debug) fprintf(stderr, "[gsa] bag: %zu urls cached\n", m_bag.size());
+}
+
+std::string GsaClient::endpoint(const std::string& key, const std::string& fallback) const {
+    auto it = m_bag.find(key);
+    return (it != m_bag.end() && !it->second.empty()) ? it->second : fallback;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 GsaClient::Result GsaClient::login(const std::string&  email,
                                    const std::string&  password,
                                    const AnisetteData& anisette,
@@ -208,6 +249,11 @@ GsaClient::Result GsaClient::login(const std::string&  email,
     if (ani.clientTime.empty()) ani.clientTime = iso8601_now();
     const PlistDict cpd  = make_cpd(ani);
     const auto      hdrs = build_headers(ani);
+
+    // Resolve endpoints from the bag (bootstrap GET), with hard-coded fallbacks.
+    lookup_bag();
+    const string gsSvc  = endpoint("gsService",    GSA_ENDPOINT);
+    const string valUrl = endpoint("validateCode", GSA_VALIDATE);
 
     // ── init ──────────────────────────────────────────────────────────────
     srp::Client cli;                       // random a, computes A
@@ -219,7 +265,7 @@ GsaClient::Result GsaClient::login(const std::string&  email,
     ri["u"]   = PlistValue::makeString(email);
     ri["o"]   = PlistValue::makeString("init");
 
-    const HttpResponse r1 = m_http.post(GSA_ENDPOINT, encode_plist_xml(wrap_request(ri)), hdrs);
+    const HttpResponse r1 = m_http.post(gsSvc, encode_plist_xml(wrap_request(ri)), hdrs);
     if (r1.statusCode != 200) throw IpaError("GSA init: HTTP " + std::to_string(r1.statusCode));
     const PlistDict d1o = decode_plist(r1.body);
     check_status(d1o, "init");
@@ -244,7 +290,7 @@ GsaClient::Result GsaClient::login(const std::string&  email,
     rc["o"]   = PlistValue::makeString("complete");
     rc["u"]   = PlistValue::makeString(email);
 
-    const HttpResponse r2 = m_http.post(GSA_ENDPOINT, encode_plist_xml(wrap_request(rc)), hdrs);
+    const HttpResponse r2 = m_http.post(gsSvc, encode_plist_xml(wrap_request(rc)), hdrs);
     if (r2.statusCode != 200) throw IpaError("GSA complete: HTTP " + std::to_string(r2.statusCode));
     const PlistDict d2o = decode_plist(r2.body);
     check_status(d2o, "complete");
@@ -275,7 +321,7 @@ GsaClient::Result GsaClient::login(const std::string&  email,
         const string dsid = dict_str(spd, "adsid");
         const string tok  = dict_str(spd, "GsIdmsToken");
         if (authCode.empty()) throw AuthCodeRequired();   // GUI supplies the code
-        if (!do_2fa_validate(m_http, m_debug, dsid, tok, authCode, ani))
+        if (!do_2fa_validate(m_http, m_debug, valUrl, dsid, tok, authCode, ani))
             throw IpaError("GSA 2FA: invalid code");
         return login(email, password, anisette, "__2fa_done__");  // fresh SRP, now trusted
     }

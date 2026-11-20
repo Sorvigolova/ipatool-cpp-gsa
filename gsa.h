@@ -16,6 +16,7 @@
 #include "http_client.h"
 #include "ipatool.h"       // IpaError, AuthCodeRequired
 #include <string>
+#include <map>
 
 // Anisette headers for the GSA / MidService flow (X-Apple-I-MD family).
 // Filled by AppStore::gsa_anisette() from AdiRequestOTP(gsaMachineDSID).
@@ -66,12 +67,19 @@ private:
     const HttpClient& m_http;
     bool              m_debug;
 
-    // Planned internals (TODO):
-    //   PlistDict make_cpd(const AnisetteData&);           // anisette echoed in body
-    //   headers build_headers(const AnisetteData&);        // iTunes/Mac UA + MD-M
-    //   srp init ("o"=init)      → { s, B, i, c }
-    //   srp complete ("o"=complete) → { spd(enc), Status }
-    //   spd = aes::cbc_decrypt( HMAC(K,"extra data key:"), HMAC(K,"extra data iv:")[:16], enc )
-    //   check_status: ec -22421 → bad password; ec -22020 / spd status 409 → 2FA
-    //   do_2fa_validate(dsid, idmsToken, code, anisette)   // GET GsService2/validate
+    // GSA config "bag": urls (and some cfgs) fetched once from the bootstrap
+    // endpoint and cached. The bag is the source of truth for every GSA/Mid URL
+    // (gsService, validateCode, midStart/FinishProvisioning, postData, …) — Apple
+    // moves these, and not all share the gsa.apple.com host, so we read full URLs
+    // by key instead of composing paths. Populated by lookup_bag() on first use.
+    std::map<std::string, std::string> m_bag;
+
+    // Fetch + cache the bag. MUST be a bare GET (UA only, NO anisette headers):
+    // anisette provisioning needs the Mid* URLs that live in the bag, so the bag
+    // cannot itself depend on anisette (chicken-and-egg). Best-effort — on failure
+    // m_bag stays empty and endpoint() falls back to the hard-coded defaults.
+    void lookup_bag();
+
+    // Full URL for a bag key, or `fallback` if the bag lacks it / wasn't fetched.
+    std::string endpoint(const std::string& key, const std::string& fallback) const;
 };
