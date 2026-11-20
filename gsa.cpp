@@ -16,8 +16,10 @@
 #include "sha2.h"
 #include "aes.h"
 #include "protect.h"     // secure_random (global)
+#include "path_utf8.h"   // ipt::write_err_utf8 — UTF-8-safe --debug output
 #include <map>
 #include <string>
+#include <sstream>
 #include <ctime>
 #include <cstdio>
 #include <cstdint>
@@ -52,21 +54,22 @@ Bytes dict_data(const PlistDict& d, const string& key) {
 // so nothing needs masking.
 void dbg_dump_req(const char* label, const char* method, const string& url,
                   const std::map<string, string>& headers, const string& body = "") {
-    fprintf(stderr, "[gsa] -- %s request --\n[gsa] %s %s\n[gsa] headers:\n",
-            label, method, url.c_str());
-    for (const auto& kv : headers)
-        fprintf(stderr, "  %s: %s\n", kv.first.c_str(), kv.second.c_str());
-    if (!body.empty())
-        fprintf(stderr, "[gsa] body (%zu bytes):\n%s\n", body.size(), body.c_str());
+    std::ostringstream o;
+    o << "[gsa] -- " << label << " request --\n[gsa] " << method << " " << url
+      << "\n[gsa] headers:\n";
+    for (const auto& kv : headers) o << "  " << kv.first << ": " << kv.second << "\n";
+    if (!body.empty()) o << "[gsa] body (" << body.size() << " bytes):\n" << body << "\n";
+    ipt::write_err_utf8(o.str());
 }
 
 void dbg_dump_resp(const char* label, const HttpResponse& r) {
-    fprintf(stderr, "[gsa] -- %s response --\n[gsa] status: %d\n[gsa] headers:\n",
-            label, r.statusCode);
-    for (const auto& kv : r.headers)
-        fprintf(stderr, "  %s: %s\n", kv.first.c_str(), kv.second.c_str());
-    fprintf(stderr, "[gsa] body (%zu bytes):\n%s\n",
-            r.body.size(), r.body.empty() ? "<empty>" : r.body.c_str());
+    std::ostringstream o;
+    o << "[gsa] -- " << label << " response --\n[gsa] status: " << r.statusCode
+      << "\n[gsa] headers:\n";
+    for (const auto& kv : r.headers) o << "  " << kv.first << ": " << kv.second << "\n";
+    o << "[gsa] body (" << r.body.size() << " bytes):\n"
+      << (r.body.empty() ? "<empty>" : r.body) << "\n";
+    ipt::write_err_utf8(o.str());
 }
 
 string iso8601_now() {
@@ -296,7 +299,7 @@ std::map<std::string, std::string> gsa_fetch_bag(const HttpClient& http,
             rep += "\n        " + std::string(k) + " = "
                  + (it == bag.end() ? "<absent>" : clip(it->second));
         }
-        fprintf(stderr, "[gsa] %s\n", rep.c_str());
+        ipt::write_err_utf8("[gsa] " + rep + "\n");
     }
     return bag;
 }

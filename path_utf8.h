@@ -21,6 +21,7 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <windows.h>
+#  include <io.h>      // _isatty / _fileno
 #endif
 
 namespace ipt {
@@ -62,6 +63,23 @@ inline std::string to_utf8(const std::filesystem::path& p) {
     return wide_to_utf8(p.wstring());
 }
 
+// Write UTF-8 text to stderr so it renders on a real Windows console (which
+// otherwise reads raw UTF-8 bytes as its OEM code page → mojibake). On a console
+// we go through WriteConsoleW (UTF-16); a redirected stderr (file/pipe) keeps the
+// raw UTF-8 bytes.
+inline void write_err_utf8(const std::string& s) {
+    if (_isatty(_fileno(stderr))) {
+        std::wstring w = utf8_to_wide(s);
+        HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+        if (h != INVALID_HANDLE_VALUE && !w.empty()) {
+            DWORD written = 0;
+            WriteConsoleW(h, w.data(), static_cast<DWORD>(w.size()), &written, nullptr);
+            return;
+        }
+    }
+    std::fwrite(s.data(), 1, s.size(), stderr);
+}
+
 #else  // POSIX — UTF-8 is the native encoding
 
 inline std::filesystem::path fs_path(const std::string& utf8) {
@@ -74,6 +92,10 @@ inline FILE* fopen_utf8(const std::string& path, const char* mode) {
 
 inline std::string to_utf8(const std::filesystem::path& p) {
     return p.string();
+}
+
+inline void write_err_utf8(const std::string& s) {
+    std::fwrite(s.data(), 1, s.size(), stderr);
 }
 
 #endif
