@@ -261,9 +261,8 @@ std::map<std::string, std::string> gsa_fetch_bag(const HttpClient& http,
     HttpResponse r;
     try { r = http.get(GSA_LOOKUP, h); }
     catch (...) { if (debug) fprintf(stderr, "[gsa] bag lookup: request failed\n"); return bag; }
-    if (debug) dbg_dump_resp("GSA bag lookup", r);
     if (r.statusCode != 200 || r.body.empty()) {
-        if (debug) fprintf(stderr, "[gsa] bag lookup: HTTP %d\n", r.statusCode);
+        if (debug) fprintf(stderr, "[gsa] bag lookup: HTTP %d (%zu B)\n", r.statusCode, r.body.size());
         return bag;
     }
     try {
@@ -277,7 +276,22 @@ std::map<std::string, std::string> gsa_fetch_bag(const HttpClient& http,
         bag.clear();
         return bag;
     }
-    if (debug) fprintf(stderr, "[gsa] bag: %zu urls cached\n", bag.size());
+    // Compact summary (like the AppStore native-bag debug) instead of the ~21 KB body.
+    if (debug) {
+        auto clip = [](const std::string& s) {
+            return s.size() > 110 ? s.substr(0, 110) + "…" : s;
+        };
+        std::string rep = "bag lookup: HTTP " + std::to_string(r.statusCode) + ", " +
+                          std::to_string(r.body.size()) + " B, " +
+                          std::to_string(bag.size()) + " urls";
+        for (const char* k : { "gsService", "validateCode", "trustedDeviceSecondaryAuth",
+                               "midStartProvisioning", "midFinishProvisioning", "postData" }) {
+            auto it = bag.find(k);
+            rep += "\n        " + std::string(k) + " = "
+                 + (it == bag.end() ? "<absent>" : clip(it->second));
+        }
+        fprintf(stderr, "[gsa] %s\n", rep.c_str());
+    }
     return bag;
 }
 
