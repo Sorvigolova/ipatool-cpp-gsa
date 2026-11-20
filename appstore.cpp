@@ -3593,7 +3593,7 @@ HttpClient& AppStore::gsa_http() {
 
 std::string AppStore::gsa_bag(const std::string& key, const std::string& fallback) {
     if (!m_gsaBagFetched) {                 // one bootstrap lookup per run
-        m_gsaBag        = gsa_fetch_bag(gsa_http(), m_debug);
+        m_gsaBag        = gsa_fetch_bag(gsa_http(), ANISETTE_CLIENT_INFO, m_debug);
         m_gsaBagFetched = true;
     }
     auto it = m_gsaBag.find(key);

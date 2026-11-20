@@ -35,12 +35,14 @@ struct AnisetteData {
     bool is_complete() const { return !otp.empty() && !machineID.empty(); }
 };
 
-// Fetch + parse the GSA "bag" (its `urls` map) with a bare bootstrap GET — UA
-// only, NO anisette (provisioning URLs live in the bag, so it can't depend on
-// anisette). Shared by GsaClient (gsService/validateCode) and the AppStore
-// provisioning/postData paths (midStart/FinishProvisioning, postData). Best-
+// Fetch + parse the GSA "bag" (its `urls` map). Bootstrap GET that needs only the
+// client-info header (tested: X-MMe-Client-Info alone gives 200; LU / Device-Id
+// are not required and no anisette OTP is involved — the bag can't depend on being
+// provisioned, since the provisioning URLs live in it). Shared by GsaClient
+// (gsService/validateCode) and the AppStore provisioning/postData paths. Best-
 // effort: returns an empty map on any failure, and callers fall back to defaults.
-std::map<std::string, std::string> gsa_fetch_bag(const HttpClient& http, bool debug = false);
+std::map<std::string, std::string> gsa_fetch_bag(const HttpClient& http,
+    const std::string& clientInfo, bool debug = false);
 
 class GsaClient {
 public:
@@ -87,7 +89,7 @@ private:
     // anisette provisioning needs the Mid* URLs that live in the bag, so the bag
     // cannot itself depend on anisette (chicken-and-egg). Best-effort — on failure
     // m_bag stays empty and endpoint() falls back to the hard-coded defaults.
-    void lookup_bag();
+    void lookup_bag(const AnisetteData& a);   // identity headers come from `a`
 
     // Full URL for a bag key, or `fallback` if the bag lacks it / wasn't fetched.
     std::string endpoint(const std::string& key, const std::string& fallback) const;

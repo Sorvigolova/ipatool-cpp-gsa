@@ -233,12 +233,16 @@ PlistDict response_of(const PlistDict& outer) {
 
 // Bare GET of the GSA bag — UA only, NO anisette (see header). Best-effort:
 // any failure leaves m_bag empty and endpoint() falls back to the defaults.
-std::map<std::string, std::string> gsa_fetch_bag(const HttpClient& http, bool debug) {
+std::map<std::string, std::string> gsa_fetch_bag(const HttpClient& http,
+    const std::string& clientInfo, bool debug) {
     std::map<std::string, std::string> bag;
     std::map<string, string> h = {
         {"User-Agent", GSA_UA},
         {"Accept",     "*/*"},
     };
+    // Tested: client-info alone yields 200 (LU / Device-Id are not required, and
+    // no anisette OTP is involved — the machine need not be provisioned).
+    if (!clientInfo.empty()) h["X-MMe-Client-Info"] = clientInfo;
     if (debug) dbg_dump_req("GSA bag lookup", "GET", GSA_LOOKUP, h);
     HttpResponse r;
     try { r = http.get(GSA_LOOKUP, h); }
@@ -263,8 +267,9 @@ std::map<std::string, std::string> gsa_fetch_bag(const HttpClient& http, bool de
     return bag;
 }
 
-void GsaClient::lookup_bag() {
-    if (m_bag.empty()) m_bag = gsa_fetch_bag(m_http, m_debug);
+void GsaClient::lookup_bag(const AnisetteData& a) {
+    if (m_bag.empty())
+        m_bag = gsa_fetch_bag(m_http, a.clientInfo, m_debug);
 }
 
 std::string GsaClient::endpoint(const std::string& key, const std::string& fallback) const {
@@ -284,7 +289,7 @@ GsaClient::Result GsaClient::login(const std::string&  email,
     const auto      hdrs = build_headers(ani);
 
     // Resolve endpoints from the bag (bootstrap GET), with hard-coded fallbacks.
-    lookup_bag();
+    lookup_bag(ani);
     const string gsSvc  = endpoint("gsService",    GSA_ENDPOINT);
     const string valUrl = endpoint("validateCode", GSA_VALIDATE);
 
