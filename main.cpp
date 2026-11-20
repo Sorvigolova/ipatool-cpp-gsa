@@ -14,7 +14,7 @@
 //   Key = SHA256(get_machine_id() + "nice_key_is_nice" + passphrase) — derived fresh each use, never stored
 //
 // Usage:
-//   ipatool auth login   -e user@example.com -p password [--auth-code 123456] [--gsa]
+//   ipatool auth login   -e user@example.com -p password [--auth-code 123456]
 //   ipatool search       "angry birds" [-l 5]
 //   ipatool purchase     -b com.example.app
 //   ipatool download     -b com.example.app [-o ./output.ipa]
@@ -640,7 +640,7 @@ static bool silent_relogin(Account& acc, const std::string& passphrase) {
         try {
             AppStore store(COOKIE_FILE);
             auto pwd = acc.password.decrypt();
-            Account fresh = store.login(acc.email, pwd.str(), authCode);
+            Account fresh = store.login_gsa(acc.email, pwd.str(), authCode);
             // kbsync is bound to DSID + hardwareID, not the session token, so a
             // token refresh must not throw it away. Same account (same DSID) →
             // carry the cached blob over instead of forcing a ~20 s+ regen.
@@ -713,10 +713,6 @@ static void cmd_login(const Args& args) {
     std::string authCode   = get(args, "auth-code",           "a");
     std::string passphrase = get(args, "keychain-passphrase", "");
     bool interactive = is_tty();
-    // --gsa: sign in through Grand Slam (SRP-6a → PET → native). Unlike the plain
-    // native login, GSA distinguishes a wrong password from a real 2FA prompt, so
-    // a typo no longer burns a 2FA attempt. Opt-in while the flow is experimental.
-    bool useGsa = get(args, "gsa", "g") == "true";
 
     // email is always required
     if (email.empty()) {
@@ -742,14 +738,13 @@ static void cmd_login(const Args& args) {
 
     AppStore store(COOKIE_FILE);
     if (get(args, "debug") == "true") store.set_debug(true);
-    if (useGsa && get(args, "debug") == "true")
-        std::cerr << "[DEBUG] using Grand Slam (GSA) login path\n";
 
-    // Retry loop: if 2FA required, prompt for code and retry (mirrors original)
+    // Retry loop: if 2FA required, prompt for code and retry (mirrors original).
+    // Grand Slam (GSA) is the login path: it distinguishes a wrong password from a
+    // real 2FA prompt, so a typo no longer burns a 2FA attempt.
     for (int attempt = 0; attempt < 2; ++attempt) {
         try {
-            Account acc = useGsa ? store.login_gsa(email, password, authCode)
-                                 : store.login(email, password, authCode);
+            Account acc = store.login_gsa(email, password, authCode);
             // Preserve a cached kbsync when logging back into the same account
             // (same DSID): it is bound to DSID + hardwareID, not the session
             // token, so there is no need to regenerate it after a fresh login.
@@ -1768,7 +1763,6 @@ Examples:
   ipatool auth login -e user@example.com -p mypassword
   ipatool auth login -e user@example.com -p mypassword --keychain-passphrase mysecret
   ipatool auth login -e user@example.com -p mypassword --auth-code 123456
-  ipatool auth login -e user@example.com -p mypassword --gsa          (Grand Slam: tells a wrong password apart from a real 2FA prompt)
   ipatool search "angry birds" -l 5 --keychain-passphrase mysecret
   ipatool purchase -b com.example.app
   ipatool purchase -i 1234567890
@@ -1780,7 +1774,7 @@ Examples:
   ipatool download -i 1234567890 -o ./MyApp.ipa
 
 Flags per command:
-  auth login:           -e/--email  -p/--password  -a/--auth-code  -g/--gsa  --keychain-passphrase
+  auth login:           -e/--email  -p/--password  -a/--auth-code  --keychain-passphrase
   search:               <term>  -l/--limit  --keychain-passphrase
   purchase:             -b/--bundle-id | -i/--app-id   -f/--force   --keychain-passphrase
   list-purchases:       [--range YEAR-all] [--all] [--since-year Y]  --keychain-passphrase
