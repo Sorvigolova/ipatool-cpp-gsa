@@ -67,7 +67,7 @@ public:
     // Full SRP-6a handshake.
     //   - throws AuthCodeRequired when 2FA is needed and authCode is empty
     //     (Apple has already pushed the code by then)
-    //   - throws IpaError("Bad Apple ID or password") on GSA ec -22421
+    //   - throws IpaError("Incorrect Apple ID or password") on GSA ec -22421/-22406
     // Call again with the 6-digit code to finish. Stateless: re-runs SRP after a
     // successful validate (the handshake is cheap), so the GUI can drive it as
     // two calls without holding server state between them.

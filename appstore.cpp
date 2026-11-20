@@ -3746,7 +3746,7 @@ Account AppStore::login_gsa(const std::string& email,
     //    throws AuthCodeRequired when a code is needed (Apple has already pushed
     //    it), and the GUI re-calls login_gsa with that code. Unlike the plain
     //    native login, GSA tells a wrong password apart from a real 2FA prompt
-    //    (ec -22421 → IpaError("Bad Apple ID or password")), so the user isn't
+    //    (ec -22421/-22406 → IpaError("Incorrect Apple ID or password")), so the user isn't
     //    nudged toward a code request that would burn an attempt.
     AnisetteData ani = gsa_anisette();
     GsaClient gsa(gsa_http(), m_debug);

@@ -182,7 +182,8 @@ std::map<string, string> build_2fa_headers(const AnisetteData& a,
     return h;
 }
 
-// Response Status.ec check. -22421 = bad password; -22020 = needs 2FA.
+// Response Status.ec check. -22421/-22406 = bad password, -20970 = unknown Apple ID,
+// -22020 = needs 2FA.
 void check_status(const PlistDict& d, const char* step) {
     const PlistDict* look = &d;
     PlistDict resp;
@@ -192,7 +193,12 @@ void check_status(const PlistDict& d, const char* step) {
     const PlistDict& st = it->second.dictVal;
     const int64_t ec = dict_int(st, "ec");
     if (ec == 0) return;
-    if (ec == -22421) throw IpaError("Bad Apple ID or password");
+    // Wrong credentials — one clean message instead of the raw "GSA <step> error …":
+    //   -22421 (init) / -22406 (complete) = wrong password,
+    //   -20970                            = unknown Apple ID / bad account info.
+    // Collapsing them also avoids revealing whether the email exists (anti-enumeration).
+    if (ec == -22421 || ec == -22406 || ec == -20970)
+        throw IpaError("Incorrect Apple ID or password");
     if (ec == -22020) throw AuthCodeRequired();
     throw IpaError(string("GSA ") + step + " error " + std::to_string(ec)
                    + ": " + dict_str(st, "em"));
