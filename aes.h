@@ -38,4 +38,9 @@ Bytes gcm_decrypt(const Bytes& key, const Bytes& iv,
                   const Bytes& ciphertext, const Bytes& tag,
                   const Bytes& aad = {});
 
+// AES-256-CBC decrypt with PKCS#7 padding — used only by the GSA spd decryption
+// (key/iv derived from the SRP session key K). Throws std::runtime_error on a
+// bad final block (wrong session key / corrupted ciphertext).
+Bytes cbc_decrypt(const Bytes& key, const Bytes& iv, const Bytes& ciphertext);
+
 } // namespace aes

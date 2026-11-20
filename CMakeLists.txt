@@ -724,6 +724,8 @@ add_executable(ipatool
     plist.cpp
     sha2.cpp
     aes.cpp
+    srp.cpp
+    gsa.cpp
     # SAP signing (v2.4.0+): Unicorn-based Apple dylib emulator
     MachImage.cpp
     SapMachine.cpp

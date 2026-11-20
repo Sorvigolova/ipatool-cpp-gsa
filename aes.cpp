@@ -144,3 +144,12 @@ Bytes gcm_decrypt(const Bytes& key, const Bytes& iv,
 } // namespace aes
 
 #endif
+
+// ── AES-256-CBC decrypt (GSA spd) — SKELETON (not implemented yet) ───────────
+// TODO: mbedtls_cipher with MBEDTLS_CIPHER_AES_256_CBC + PKCS7, or PSA
+//       (psa_cipher_decrypt). Verify/strip PKCS#7 padding; throw on bad block.
+namespace aes {
+Bytes cbc_decrypt(const Bytes& /*key*/, const Bytes& /*iv*/, const Bytes& /*ciphertext*/) {
+    throw std::runtime_error("aes::cbc_decrypt: not implemented yet");
+}
+} // namespace aes

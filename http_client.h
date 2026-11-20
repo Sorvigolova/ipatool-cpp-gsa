@@ -38,6 +38,12 @@ public:
                                         const HttpResponse& res)>;
     void set_observer(Observer cb) { m_observer = std::move(cb); }
 
+    // Use an embedded PEM CA bundle (CURLOPT_CAINFO_BLOB) as the trust anchor
+    // instead of the system store. Needed on Windows, where Apple's root CA may
+    // be absent and the gsa.apple.com handshake would otherwise fail. Empty
+    // (default) = system trust store. Applies to every request this client makes.
+    void set_ca_bundle(std::string pem) { m_caBundle = std::move(pem); }
+
     // Drop every stored cookie by removing the cookie file. Cookie state lives
     // only in that file (each request reloads it), so this starts the next
     // request with an empty jar. Called at the start of a login so a stale
@@ -111,6 +117,7 @@ private:
     std::string m_cookieFile;
     bool        m_debug = false;
     Observer    m_observer;
+    std::string m_caBundle;   // embedded PEM trust anchor (empty = system store)
 
     // Shared GET/POST implementation with automatic retry on transient errors.
     HttpResponse perform(const std::string& method,

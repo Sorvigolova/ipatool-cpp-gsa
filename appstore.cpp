@@ -3504,3 +3504,41 @@ std::string AppStore::str_lower(const char* s) {
     return out;
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GSA (Grand Slam) login — SKELETON (not implemented yet). See gsa.h / srp.h.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GSA machine DSID (-2). Store anon provisioning uses kAnonAdiDSID (-1).
+static constexpr uint64_t kGsaMachineDSID = ~uint64_t(1);
+
+AnisetteData AppStore::gsa_anisette() {
+    // TODO:
+    //   int32_t st = 0;
+    //   auto otp = adi_machine().AdiRequestOTP(kGsaMachineDSID, &st);
+    //   if (!otp) { gsa_provision_machine(kGsaMachineDSID);
+    //               otp = adi_machine().AdiRequestOTP(kGsaMachineDSID, &st); }
+    //   if (!otp) throw IpaError("GSA anisette: machine not provisioned");
+    //   Fill AnisetteData: otp=b64(otp->otp), machineID=b64(otp->machineID),
+    //   routingInfo (from provisioning), localUserUUID=hex(sha2::digest(identifier)),
+    //   deviceID, clientInfo (Mac, from emulated assets), serialNo, clientTime, locale, tz.
+    throw IpaError("gsa_anisette: not implemented yet");
+}
+
+void AppStore::gsa_provision_machine(uint64_t /*dsid*/) {
+    // TODO: MidService start → spim → AdiStartProvisioning → finish {cpim} →
+    //       ptm + RINFO → AdiEndProvisioning → adi_save(). Uses m_http (+CA blob).
+    throw IpaError("gsa_provision_machine: not implemented yet");
+}
+
+Account AppStore::login_gsa(const std::string& /*email*/,
+                            const std::string& /*password*/,
+                            const std::string& /*authCode*/) {
+    // TODO:
+    //   AnisetteData ani = gsa_anisette();                 // provisions -2 on demand
+    //   GsaClient gsa(m_http, m_debug);
+    //   auto r = gsa.login(email, password, ani, authCode);// PET (or AuthCodeRequired / bad pw)
+    //   // native authenticate with password = r.pet (verbatim) → X-Token → Account
+    //   return do_login(email, r.pet, authCode, get_guid(), endpoint, *signer);
+    throw IpaError("login_gsa: not implemented yet");
+}

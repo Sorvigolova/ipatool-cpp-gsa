@@ -11,6 +11,7 @@
 #include "ipatool.h"
 #include "http_client.h"
 #include "plist.h"
+#include "gsa.h"       // AnisetteData, GsaClient
 
 #include <string>
 #include <vector>
@@ -96,6 +97,14 @@ public:
                   const std::string& password,
                   const std::string& authCode = "",
                   const std::string& endpoint = "");
+
+    // Grand Slam login: obtain a PET via GSA (SRP-6a), then run the native
+    // authenticate with that PET as the password to get the store X-Token.
+    // Provisions the GSA machine (DSID -2) on demand. Throws AuthCodeRequired
+    // when 2FA is needed and authCode is empty.
+    Account login_gsa(const std::string& email,
+                      const std::string& password,
+                      const std::string& authCode = "");
 
     // ── Search ───────────────────────────────────────────────────────────────
 
@@ -226,6 +235,16 @@ private:
 
     void init_store_adi(const std::string& cookieFile);
     StoreAgentMachine& adi_machine();    // lazy create + import state (cheap: NO FairPlay init)
+    // GSA anisette: AdiRequestOTP(gsa machine DSID -2); provisions on demand via
+    // gsa_provision_machine() when the DSID isn't provisioned yet. Fills an
+    // AnisetteData (X-Apple-I-MD family) from the local emulated CoreADI.
+    AnisetteData gsa_anisette();
+    // GSA MidService machine provisioning for `dsid`:
+    //   POST gsa.apple.com/grandslam/MidService/startMachineProvisioning → spim
+    //   AdiStartProvisioning(dsid, spim) → clientData(cpim)
+    //   POST finishMachineProvisioning {cpim} → ptm + X-Apple-I-MD-RINFO
+    //   AdiEndProvisioning(session, settingInfo, transportKey); adi_save()
+    void gsa_provision_machine(uint64_t dsid);
     // Lazy FairPlayGlobalContextInit on m_adi — the slow part (~15-20 s under
     // Unicorn). Only kbsync and the keybag import need the context; OTP
     // generation (X-Apple-MD headers) and erase do not, so they never pay for it.

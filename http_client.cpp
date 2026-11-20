@@ -926,6 +926,15 @@ HttpResponse HttpClient::perform(const std::string& method,
         curl_easy_setopt(curl, CURLOPT_URL,            url.c_str());
         curl_easy_setopt(curl, CURLOPT_USERAGENT,      USER_AGENT);
         curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        // Embedded Apple CA as the trust anchor (Windows may lack it in the
+        // system store, which would fail the gsa.apple.com handshake).
+        struct curl_blob caBlob;
+        if (!m_caBundle.empty()) {
+            caBlob.data  = const_cast<char*>(m_caBundle.data());
+            caBlob.len   = m_caBundle.size();
+            caBlob.flags = CURL_BLOB_COPY;
+            curl_easy_setopt(curl, CURLOPT_CAINFO_BLOB, &caBlob);
+        }
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 15L);
         curl_easy_setopt(curl, CURLOPT_TIMEOUT,        30L);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  body_write_cb);
