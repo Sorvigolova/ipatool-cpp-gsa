@@ -32,6 +32,7 @@ constexpr const char* GSA_LOOKUP   = "https://gsa.apple.com/grandslam/GsService2
 // Fallbacks used only when the bag fetch failed or lacks the key.
 constexpr const char* GSA_ENDPOINT = "https://gsa.apple.com/grandslam/GsService2";
 constexpr const char* GSA_VALIDATE = "https://gsa.apple.com/grandslam/GsService2/validate";
+constexpr const char* GSA_TRUSTED  = "https://gsa.apple.com/auth/verify/trusteddevice";
 // GsService2 / bag-lookup User-Agent. GsService2 is an AuthKit/GSA endpoint —
 // on macOS akd owns it — so for a coherent Mac machine (our anisette/provisioning
 // already present as akd) these calls use the akd UA, not iTunes-Windows. The 2FA
@@ -217,6 +218,19 @@ bool do_2fa_validate(const HttpClient& http, bool dbg, const string& validateUrl
     return true;
 }
 
+// Trigger the 2FA push to the account's trusted devices. GSA does NOT push
+// automatically on the complete 409 — pypush shows an explicit GET to
+// /auth/verify/trusteddevice (same Xcode identity headers as validate). The
+// response is just an HTML form; the side effect — the code appearing on the
+// devices — is the point, so the body is ignored.
+void trigger_trusted_device(const HttpClient& http, bool dbg, const string& url,
+                            const string& dsid, const string& idms, const AnisetteData& a) {
+    auto hdrs = build_2fa_headers(a, dsid, idms);
+    if (dbg) dbg_dump_req("GSA trigger 2FA (trusteddevice)", "GET", url, hdrs);
+    const HttpResponse r = http.get(url, hdrs);
+    if (dbg) dbg_dump_resp("GSA trigger 2FA (trusteddevice)", r);
+}
+
 PlistDict wrap_request(const PlistDict& req) {
     PlistDict hdr;  hdr["Version"] = PlistValue::makeString("1.0.1");
     PlistDict w;    w["Header"]  = PlistValue::makeDict(hdr);
@@ -290,8 +304,9 @@ GsaClient::Result GsaClient::login(const std::string&  email,
 
     // Resolve endpoints from the bag (bootstrap GET), with hard-coded fallbacks.
     lookup_bag(ani);
-    const string gsSvc  = endpoint("gsService",    GSA_ENDPOINT);
-    const string valUrl = endpoint("validateCode", GSA_VALIDATE);
+    const string gsSvc   = endpoint("gsService",                 GSA_ENDPOINT);
+    const string valUrl  = endpoint("validateCode",              GSA_VALIDATE);
+    const string trustUrl = endpoint("trustedDeviceSecondaryAuth", GSA_TRUSTED);
 
     // ── init ──────────────────────────────────────────────────────────────
     srp::Client cli;                       // random a, computes A
@@ -340,10 +355,11 @@ GsaClient::Result GsaClient::login(const std::string&  email,
     check_status(d2o, "complete");
     const PlistDict d2 = response_of(d2o);
 
+    // TwoFactor/TwoStep/Allow all fall through to the spd 409 handling below
+    // (that's where the push is triggered); only a genuinely bad Result stops here.
     const string result = dict_str(d2, "Result");
-    if (result == "TwoFactorAuthentication" || result == "TwoStepVerification") {
-        if (authCode.empty()) throw AuthCodeRequired();
-    } else if (!result.empty() && result != "Allow") {
+    if (!result.empty() && result != "Allow"
+        && result != "TwoFactorAuthentication" && result != "TwoStepVerification") {
         if (result == "RepairRequired")
             throw IpaError("Apple ID needs repair at appleid.apple.com");
         throw IpaError("GSA: unexpected Result = " + result);
@@ -357,6 +373,9 @@ GsaClient::Result GsaClient::login(const std::string&  email,
     div.resize(16);
     const Bytes spd_plain = aes::cbc_decrypt(dk, div, spd_enc);
     const PlistDict spd = decode_plist(std::string(spd_plain.begin(), spd_plain.end()));
+    if (m_debug)
+        fprintf(stderr, "[gsa] -- decrypted spd (%zu bytes) --\n%s\n",
+                spd_plain.size(), encode_plist_xml(spd).c_str());
 
     // ── 2FA (status-code 409 inside spd) ───────────────────────────────────
     if (dict_int(spd, "status-code") == 409) {
@@ -364,7 +383,12 @@ GsaClient::Result GsaClient::login(const std::string&  email,
             throw IpaError("GSA 2FA: still 409 after validation");
         const string dsid = dict_str(spd, "adsid");
         const string tok  = dict_str(spd, "GsIdmsToken");
-        if (authCode.empty()) throw AuthCodeRequired();   // GUI supplies the code
+        if (authCode.empty()) {
+            // Explicitly ask Apple to push the code to the trusted devices, then
+            // let the GUI collect it. Without this GET nothing ever arrives.
+            trigger_trusted_device(m_http, m_debug, trustUrl, dsid, tok, ani);
+            throw AuthCodeRequired();
+        }
         if (!do_2fa_validate(m_http, m_debug, valUrl, dsid, tok, authCode, ani))
             throw IpaError("GSA 2FA: invalid code");
         return login(email, password, anisette, "__2fa_done__");  // fresh SRP, now trusted
@@ -389,7 +413,8 @@ GsaClient::Result GsaClient::login(const std::string&  email,
         }
     }
 
-    // PET: spd t/com.apple.gs.idms.pet/token (already carries the "PET" tag).
+    // PET lives in spd's "t" dict: com.apple.gs.idms.pet/token (~5 min; the native
+    // authenticate password, already carrying Apple's "PET" tag).
     {
         auto t = spd.find("t");
         if (t != spd.end() && t->second.isDict()) {
@@ -399,15 +424,6 @@ GsaClient::Result GsaClient::login(const std::string&  email,
         }
     }
     if (res.pet.empty()) throw IpaError("GSA: PET missing from spd");
-
-    // HB token for the post-login postData heartbeat (best-effort; postData is
-    // not on the X-Token path). TODO(dump): confirm the exact spd key — these are
-    // best-guess candidates, and on the 2FA path the validate reply may carry a
-    // refreshed token. postData stays a no-op until this is populated.
-    for (const char* k : {"hb-token", "hbToken", "HeartbeatToken", "ht"}) {
-        res.hbToken = dict_str(spd, k);
-        if (!res.hbToken.empty()) break;
-    }
 
     for (auto& hk : {"x-apple-store-front", "x-apple-storefront"}) {
         auto it = r2.headers.find(hk);

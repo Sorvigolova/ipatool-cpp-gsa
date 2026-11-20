@@ -49,6 +49,10 @@ public:
     explicit GsaClient(const HttpClient& http, bool debug = false)
         : m_http(http), m_debug(debug) {}
 
+    // Prime the bag cache from a caller that already fetched it once (e.g. AppStore
+    // across its two login_gsa calls), so lookup_bag() does no second GET.
+    void set_bag(std::map<std::string, std::string> bag) { m_bag = std::move(bag); }
+
     // Result of a successful GSA login. `pet` is the only field the store path
     // actually needs; the rest is useful context for logging / future use.
     struct Result {
@@ -58,8 +62,6 @@ public:
         std::string firstName;
         std::string lastName;
         std::string storeFront;   // if the server returned one
-        std::string hbToken;      // X-Apple-HB-Token for the post-login postData heartbeat
-                                  // (from complete's spd, refreshed from validate on 2FA)
     };
 
     // Full SRP-6a handshake.

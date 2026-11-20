@@ -96,7 +96,8 @@ public:
     Account login(const std::string& email,
                   const std::string& password,
                   const std::string& authCode = "",
-                  const std::string& endpoint = "");
+                  const std::string& endpoint = "",
+                  bool maskPassword = true);   // false when password is a short-lived PET
 
     // Grand Slam login: obtain a PET via GSA (SRP-6a), then run the native
     // authenticate with that PET as the password to get the store X-Token.
@@ -270,12 +271,8 @@ private:
     // full URL for a key, or `fallback` when the bag is unavailable / lacks it.
     std::map<std::string, std::string> m_gsaBag;
     bool        m_gsaBagFetched = false;
+    const std::map<std::string, std::string>& gsa_bag_all();  // fetch-once, return whole bag
     std::string gsa_bag(const std::string& key, const std::string& fallback);
-
-    // Post-login liveness heartbeat (bag "postData"). Best-effort and OFF the
-    // X-Token path: it only enriches the account's device list. Skeleton for now
-    // — needs the HB token from the GSA exchange; a no-op until that is present.
-    void        gsa_post_data(const std::string& hbToken);
 
     // Lazy FairPlayGlobalContextInit on m_adi — the slow part (~15-20 s under
     // Unicorn). Only kbsync and the keybag import need the context; OTP
@@ -400,7 +397,8 @@ private:
                      const std::string& authCode,
                      const std::string& guid,
                      const std::string& baseEndpoint,
-                     SapSigner& signer);   // every authenticate POST is SAP-signed
+                     SapSigner& signer,     // every authenticate POST is SAP-signed
+                     bool maskPassword = true);  // false when password is a short-lived PET
 
     // ── Purchase implementation ───────────────────────────────────────────────
     PlistDict do_purchase(const Account& acc, const App& app,
