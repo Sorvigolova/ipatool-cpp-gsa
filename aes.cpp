@@ -83,10 +83,41 @@ Bytes gcm_decrypt(const Bytes& key, const Bytes& iv,
     return plain;
 }
 
+// AES-256-CBC + PKCS#7 (GSA spd). PSA one-shot takes IV prepended to the input
+// and strips PKCS#7 on finish; matches the previous OpenSSL EVP behaviour.
+Bytes cbc_decrypt(const Bytes& key, const Bytes& iv, const Bytes& ciphertext) {
+    ensure_psa();
+    psa_key_attributes_t attr = PSA_KEY_ATTRIBUTES_INIT;
+    psa_set_key_usage_flags(&attr, PSA_KEY_USAGE_DECRYPT);
+    psa_set_key_algorithm(&attr, PSA_ALG_CBC_PKCS7);
+    psa_set_key_type(&attr, PSA_KEY_TYPE_AES);
+    psa_key_id_t k = 0;
+    if (psa_import_key(&attr, key.data(), key.size(), &k) != PSA_SUCCESS)
+        throw std::runtime_error("aes::cbc_decrypt: key import failed");
+
+    // PSA one-shot expects IV || ciphertext as a single input buffer.
+    Bytes in;
+    in.reserve(iv.size() + ciphertext.size());
+    in.insert(in.end(), iv.begin(), iv.end());
+    in.insert(in.end(), ciphertext.begin(), ciphertext.end());
+
+    Bytes  out(ciphertext.size());   // plaintext is <= ciphertext (padding removed)
+    size_t olen = 0;
+    psa_status_t s = psa_cipher_decrypt(
+        k, PSA_ALG_CBC_PKCS7, in.data(), in.size(),
+        out.data(), out.size(), &olen);
+    psa_destroy_key(k);
+    if (s != PSA_SUCCESS)
+        throw std::runtime_error("aes::cbc_decrypt: decryption failed (bad key or padding)");
+    out.resize(olen);
+    return out;
+}
+
 } // namespace aes
 
 #else  // ── mbedTLS 2.x / 3.x: legacy low-level GCM ─────────────────────────────
 #  include <mbedtls/gcm.h>
+#  include <mbedtls/cipher.h>
 
 namespace aes {
 
@@ -141,15 +172,38 @@ Bytes gcm_decrypt(const Bytes& key, const Bytes& iv,
     return plain;
 }
 
+// AES-256-CBC + PKCS#7 (GSA spd). The mbedtls_cipher layer validates and strips
+// PKCS#7 on finish; matches the previous OpenSSL EVP behaviour.
+Bytes cbc_decrypt(const Bytes& key, const Bytes& iv, const Bytes& ciphertext) {
+    const mbedtls_cipher_info_t* info =
+        mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_256_CBC);
+    if (!info)
+        throw std::runtime_error("aes::cbc_decrypt: AES-256-CBC unavailable");
+
+    mbedtls_cipher_context_t ctx;
+    mbedtls_cipher_init(&ctx);
+
+    Bytes  out(ciphertext.size() + 16);   // headroom; trimmed to real length below
+    size_t olen = 0, finlen = 0;
+
+    int rc = mbedtls_cipher_setup(&ctx, info);
+    if (rc == 0) rc = mbedtls_cipher_setkey(&ctx, key.data(),
+                          static_cast<int>(key.size() * 8), MBEDTLS_DECRYPT);
+    if (rc == 0) rc = mbedtls_cipher_set_padding_mode(&ctx, MBEDTLS_PADDING_PKCS7);
+    if (rc == 0) rc = mbedtls_cipher_set_iv(&ctx, iv.data(), iv.size());
+    if (rc == 0) rc = mbedtls_cipher_reset(&ctx);
+    if (rc == 0) rc = mbedtls_cipher_update(&ctx, ciphertext.data(), ciphertext.size(),
+                          out.data(), &olen);
+    if (rc == 0) rc = mbedtls_cipher_finish(&ctx, out.data() + olen, &finlen);
+    mbedtls_cipher_free(&ctx);
+
+    // MBEDTLS_ERR_CIPHER_INVALID_PADDING (or any non-zero) → wrong key / corruption.
+    if (rc != 0)
+        throw std::runtime_error("aes::cbc_decrypt: decryption failed (bad key or padding)");
+    out.resize(olen + finlen);
+    return out;
+}
+
 } // namespace aes
 
 #endif
-
-// ── AES-256-CBC decrypt (GSA spd) — SKELETON (not implemented yet) ───────────
-// TODO: mbedtls_cipher with MBEDTLS_CIPHER_AES_256_CBC + PKCS7, or PSA
-//       (psa_cipher_decrypt). Verify/strip PKCS#7 padding; throw on bad block.
-namespace aes {
-Bytes cbc_decrypt(const Bytes& /*key*/, const Bytes& /*iv*/, const Bytes& /*ciphertext*/) {
-    throw std::runtime_error("aes::cbc_decrypt: not implemented yet");
-}
-} // namespace aes
