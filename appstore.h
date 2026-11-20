@@ -265,6 +265,18 @@ private:
     void        gsa_load_identity();         // load-or-create seed (+ rinfo)
     void        gsa_save_identity() const;   // persist seed + rinfo
 
+    // GSA "bag" (urls), fetched once via the bootstrap lookup and shared by the
+    // provisioning (midStart/Finish) and postData paths. gsa_bag() returns the
+    // full URL for a key, or `fallback` when the bag is unavailable / lacks it.
+    std::map<std::string, std::string> m_gsaBag;
+    bool        m_gsaBagFetched = false;
+    std::string gsa_bag(const std::string& key, const std::string& fallback);
+
+    // Post-login liveness heartbeat (bag "postData"). Best-effort and OFF the
+    // X-Token path: it only enriches the account's device list. Skeleton for now
+    // — needs the HB token from the GSA exchange; a no-op until that is present.
+    void        gsa_post_data(const std::string& hbToken);
+
     // Lazy FairPlayGlobalContextInit on m_adi — the slow part (~15-20 s under
     // Unicorn). Only kbsync and the keybag import need the context; OTP
     // generation (X-Apple-MD headers) and erase do not, so they never pay for it.

@@ -207,31 +207,36 @@ PlistDict response_of(const PlistDict& outer) {
 
 // Bare GET of the GSA bag — UA only, NO anisette (see header). Best-effort:
 // any failure leaves m_bag empty and endpoint() falls back to the defaults.
-void GsaClient::lookup_bag() {
-    if (!m_bag.empty()) return;
+std::map<std::string, std::string> gsa_fetch_bag(const HttpClient& http, bool debug) {
+    std::map<std::string, std::string> bag;
     std::map<string, string> h = {
         {"User-Agent", ITUNES_UA},
         {"Accept",     "*/*"},
     };
     HttpResponse r;
-    try { r = m_http.get(GSA_LOOKUP, h); }
-    catch (...) { if (m_debug) fprintf(stderr, "[gsa] bag lookup: request failed\n"); return; }
+    try { r = http.get(GSA_LOOKUP, h); }
+    catch (...) { if (debug) fprintf(stderr, "[gsa] bag lookup: request failed\n"); return bag; }
     if (r.statusCode != 200 || r.body.empty()) {
-        if (m_debug) fprintf(stderr, "[gsa] bag lookup: HTTP %d\n", r.statusCode);
-        return;
+        if (debug) fprintf(stderr, "[gsa] bag lookup: HTTP %d\n", r.statusCode);
+        return bag;
     }
     try {
         const PlistDict root = response_of(decode_plist(r.body));
         const PlistDict urls = dict_dict(root, "urls");
         for (const auto& kv : urls)
             if (kv.second.isString() && !kv.second.str().empty())
-                m_bag[kv.first] = kv.second.str();
+                bag[kv.first] = kv.second.str();
     } catch (...) {
-        if (m_debug) fprintf(stderr, "[gsa] bag lookup: parse failed\n");
-        m_bag.clear();
-        return;
+        if (debug) fprintf(stderr, "[gsa] bag lookup: parse failed\n");
+        bag.clear();
+        return bag;
     }
-    if (m_debug) fprintf(stderr, "[gsa] bag: %zu urls cached\n", m_bag.size());
+    if (debug) fprintf(stderr, "[gsa] bag: %zu urls cached\n", bag.size());
+    return bag;
+}
+
+void GsaClient::lookup_bag() {
+    if (m_bag.empty()) m_bag = gsa_fetch_bag(m_http, m_debug);
 }
 
 std::string GsaClient::endpoint(const std::string& key, const std::string& fallback) const {
@@ -355,6 +360,15 @@ GsaClient::Result GsaClient::login(const std::string&  email,
         }
     }
     if (res.pet.empty()) throw IpaError("GSA: PET missing from spd");
+
+    // HB token for the post-login postData heartbeat (best-effort; postData is
+    // not on the X-Token path). TODO(dump): confirm the exact spd key — these are
+    // best-guess candidates, and on the 2FA path the validate reply may carry a
+    // refreshed token. postData stays a no-op until this is populated.
+    for (const char* k : {"hb-token", "hbToken", "HeartbeatToken", "ht"}) {
+        res.hbToken = dict_str(spd, k);
+        if (!res.hbToken.empty()) break;
+    }
 
     for (auto& hk : {"x-apple-store-front", "x-apple-storefront"}) {
         auto it = r2.headers.find(hk);

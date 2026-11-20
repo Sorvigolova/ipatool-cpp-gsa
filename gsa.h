@@ -35,6 +35,13 @@ struct AnisetteData {
     bool is_complete() const { return !otp.empty() && !machineID.empty(); }
 };
 
+// Fetch + parse the GSA "bag" (its `urls` map) with a bare bootstrap GET — UA
+// only, NO anisette (provisioning URLs live in the bag, so it can't depend on
+// anisette). Shared by GsaClient (gsService/validateCode) and the AppStore
+// provisioning/postData paths (midStart/FinishProvisioning, postData). Best-
+// effort: returns an empty map on any failure, and callers fall back to defaults.
+std::map<std::string, std::string> gsa_fetch_bag(const HttpClient& http, bool debug = false);
+
 class GsaClient {
 public:
     explicit GsaClient(const HttpClient& http, bool debug = false)
@@ -49,6 +56,8 @@ public:
         std::string firstName;
         std::string lastName;
         std::string storeFront;   // if the server returned one
+        std::string hbToken;      // X-Apple-HB-Token for the post-login postData heartbeat
+                                  // (from complete's spd, refreshed from validate on 2FA)
     };
 
     // Full SRP-6a handshake.

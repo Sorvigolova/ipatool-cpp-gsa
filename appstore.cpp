@@ -3530,6 +3530,11 @@ constexpr const char* ANISETTE_CLIENT_INFO =
     "<MacBookPro13,3> <Mac OS X;10.12.6;16G29> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
 constexpr const char* ANISETTE_UA =
     "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0";
+// postData (liveness heartbeat) bootstrap defaults — overridden by the bag.
+constexpr const char* POSTDATA_URL_FALLBACK =
+    "https://gsas.apple.com/grandslam/GsService2/postdata";
+constexpr const char* POSTDATA_UA =
+    "iTunes (unknown version) CFNetwork/520.32.4";   // TODO(dump): Mac/akd UA for parity?
 
 std::string gsa_to_hex(const std::vector<uint8_t>& b) {
     static const char* h = "0123456789abcdef";
@@ -3584,6 +3589,15 @@ HttpClient& AppStore::gsa_http() {
         m_gsaHttpReady = true;
     }
     return m_gsaHttp;
+}
+
+std::string AppStore::gsa_bag(const std::string& key, const std::string& fallback) {
+    if (!m_gsaBagFetched) {                 // one bootstrap lookup per run
+        m_gsaBag        = gsa_fetch_bag(gsa_http(), m_debug);
+        m_gsaBagFetched = true;
+    }
+    auto it = m_gsaBag.find(key);
+    return (it != m_gsaBag.end() && !it->second.empty()) ? it->second : fallback;
 }
 
 std::string AppStore::gsa_identity_path() const {
@@ -3675,7 +3689,8 @@ void AppStore::gsa_provision_machine(uint64_t dsid) {
 
     // start → spim
     prov_log("GSA MidService: start provisioning DSID " + dsid_str(dsid));
-    HttpResponse r1 = http.post(MID_START_URL, mid_body(PlistDict{}), mid_headers(lu, dev));
+    HttpResponse r1 = http.post(gsa_bag("midStartProvisioning", MID_START_URL),
+                                mid_body(PlistDict{}), mid_headers(lu, dev));
     if (r1.statusCode != 200)
         throw IpaError("GSA provisioning start: HTTP " + std::to_string(r1.statusCode));
     PlistDict resp1 = mid_response(r1.body);
@@ -3690,7 +3705,8 @@ void AppStore::gsa_provision_machine(uint64_t dsid) {
     finReq["cpim"] = PlistValue::makeString(
         base64_encode(sr.clientData.data(), sr.clientData.size()));
     prov_log("GSA MidService: finish provisioning");
-    HttpResponse r2 = http.post(MID_FINISH_URL, mid_body(finReq), mid_headers(lu, dev));
+    HttpResponse r2 = http.post(gsa_bag("midFinishProvisioning", MID_FINISH_URL),
+                                mid_body(finReq), mid_headers(lu, dev));
     if (r2.statusCode != 200)
         throw IpaError("GSA provisioning finish: HTTP " + std::to_string(r2.statusCode));
     PlistDict resp2 = mid_response(r2.body);
@@ -3708,6 +3724,49 @@ void AppStore::gsa_provision_machine(uint64_t dsid) {
     gsa_save_identity();   // persist RINFO beside the seed
     adi_save();            // persist the ADI state — now carries DSID -2
     prov_log("GSA provisioning complete (rinfo=" + std::to_string(m_gsaRinfo) + ")");
+}
+
+// Post-login liveness heartbeat. SKELETON: best-effort and OFF the X-Token path
+// (majd signs in fine without it) — it only enriches the account's device list.
+// Needs the HB token from the GSA exchange; a no-op until that is wired, and it
+// never throws (any failure is logged and swallowed).
+void AppStore::gsa_post_data(const std::string& hbToken) {
+    if (hbToken.empty()) {
+        if (m_debug) prov_log("GSA postData: no HB token yet — skipping heartbeat");
+        return;
+    }
+    try {
+        AnisetteData a = gsa_anisette();   // fresh OTP; identity (deviceID/LU) is stable
+
+        PlistDict req;
+        req["dn"]    = PlistValue::makeString("ipatool");   // TODO(dump): real device name (hostname)
+        req["event"] = PlistValue::makeString("liveness");
+        req["loc"]   = PlistValue::makeString("en");
+        PlistDict root;
+        root["Header"]  = PlistValue::makeDict(PlistDict{});
+        root["Request"] = PlistValue::makeDict(req);
+        const std::string body = encode_plist_xml(root);
+
+        std::map<std::string, std::string> h = {
+            {"Accept",             "*/*"},
+            {"Content-Type",       "text/x-xml-plist"},
+            {"User-Agent",         POSTDATA_UA},
+            {"X-Apple-HB-Token",   hbToken},
+            {"X-Apple-I-MD",       a.otp},
+            {"X-Apple-I-MD-M",     a.machineID},
+            {"X-Apple-I-MD-LU",    a.localUserUUID},
+            {"X-Apple-I-MD-RINFO", a.routingInfo},
+            {"X-Mme-Device-Id",    a.deviceID},
+            {"X-MMe-Client-Info",  a.clientInfo},
+            {"Accept-Language",    "en"},
+            {"X-Mme-Country",      "US"},
+        };
+        const std::string url = gsa_bag("postData", POSTDATA_URL_FALLBACK);
+        HttpResponse r = gsa_http().post(url, body, h);
+        if (m_debug) prov_log("GSA postData: HTTP " + std::to_string(r.statusCode));
+    } catch (const std::exception& e) {
+        if (m_debug) prov_log(std::string("GSA postData failed (ignored): ") + e.what());
+    }
 }
 
 Account AppStore::login_gsa(const std::string& email,
@@ -3730,5 +3789,10 @@ Account AppStore::login_gsa(const std::string& email,
     //    X-Token), so reuse it. No 2FA code here: the PET is already 2FA-complete,
     //    and an empty authCode keeps do_login on attempt 1.
     if (m_debug) prov_log("GSA: PET obtained, running native authenticate");
-    return login(email, r.pet, "", "");
+    Account acc = login(email, r.pet, "", "");
+
+    // Best-effort liveness heartbeat so the sign-in shows up in the account's
+    // device list. Never affects the returned Account (no-op until HB is wired).
+    gsa_post_data(r.hbToken);
+    return acc;
 }
