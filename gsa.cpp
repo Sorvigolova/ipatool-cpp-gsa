@@ -32,9 +32,12 @@ constexpr const char* GSA_LOOKUP   = "https://gsa.apple.com/grandslam/GsService2
 // Fallbacks used only when the bag fetch failed or lacks the key.
 constexpr const char* GSA_ENDPOINT = "https://gsa.apple.com/grandslam/GsService2";
 constexpr const char* GSA_VALIDATE = "https://gsa.apple.com/grandslam/GsService2/validate";
-constexpr const char* ITUNES_UA =
-    "iTunes/12.11.3 (Windows; Microsoft Windows 10 x64 Professional Edition "
-    "(Build 19041); x64) AppleWebKit/7611.3.10.1.16";
+// GsService2 / bag-lookup User-Agent. GsService2 is an AuthKit/GSA endpoint —
+// on macOS akd owns it — so for a coherent Mac machine (our anisette/provisioning
+// already present as akd) these calls use the akd UA, not iTunes-Windows. The 2FA
+// validate keeps "Xcode", matching its com.apple.gs.xcode.auth app-info.
+constexpr const char* GSA_UA =
+    "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0";
 
 // plist.h has no Data getter — small local one.
 Bytes dict_data(const PlistDict& d, const string& key) {
@@ -80,9 +83,9 @@ string country_of(const string& locale) {   // "en_US"/"en-US" → "US"
 
 // cpd — anisette data echoed inside the plist body. GSA silently rejects
 // (HTTP 200, empty body) when cpd is absent even if the headers are correct.
-// NOTE(identity): capp is still the Xcode auth widget (AltStore lineage) while
-// the UA is iTunes-Windows. Coherent-identity cleanup is a follow-up; this is
-// the proven-working combination, so the port keeps it as-is.
+// Identity is now coherently Mac/akd: capp is the Xcode auth widget and the
+// GsService2 UA is akd (see GSA_UA), matching the akd anisette/provisioning and
+// the "Xcode" 2FA validate.
 PlistDict make_cpd(const AnisetteData& a) {
     PlistDict cpd;
     cpd["bootstrap"] = PlistValue::makeBool(true);
@@ -122,7 +125,7 @@ std::map<string, string> build_headers(const AnisetteData& a) {
     std::map<string, string> h = {
         {"Content-Type",    "text/x-xml-plist"},
         {"Accept",          "*/*"},
-        {"User-Agent",      ITUNES_UA},
+        {"User-Agent",      GSA_UA},
         {"Accept-Language", "en-US,en;q=0.9"},
         {"X-Apple-I-MD-M",  a.machineID},
     };
@@ -210,7 +213,7 @@ PlistDict response_of(const PlistDict& outer) {
 std::map<std::string, std::string> gsa_fetch_bag(const HttpClient& http, bool debug) {
     std::map<std::string, std::string> bag;
     std::map<string, string> h = {
-        {"User-Agent", ITUNES_UA},
+        {"User-Agent", GSA_UA},
         {"Accept",     "*/*"},
     };
     HttpResponse r;
