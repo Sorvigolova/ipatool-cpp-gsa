@@ -410,7 +410,7 @@ GsaClient::Result GsaClient::login(const std::string&  email,
             throw AuthCodeRequired();
         }
         if (!do_2fa_validate(m_http, m_debug, valUrl, dsid, tok, authCode, ani))
-            throw IpaError("GSA 2FA: invalid code");
+            throw IpaError("Incorrect verification code");   // GSA validate ec -21669
         return login(email, password, anisette, "__2fa_done__");  // fresh SRP, now trusted
     }
 
