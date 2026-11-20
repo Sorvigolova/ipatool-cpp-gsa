@@ -743,10 +743,18 @@ add_executable(ipatool
     plist.h
     sha2.h
     aes.h
+    srp.h
+    gsa.h
+    apple_ca.h
     MachImage.h
     SapMachine.h
     SapSigner.h
     StoreAgentMachine.h
+    # Misc / support headers
+    compat_format.h
+    path_utf8.h
+    sap_resources.h
+    sap_embedded_assets.h
 )
 
 target_include_directories(ipatool PRIVATE

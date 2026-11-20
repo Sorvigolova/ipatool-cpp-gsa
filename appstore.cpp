@@ -3710,14 +3710,25 @@ void AppStore::gsa_provision_machine(uint64_t dsid) {
     prov_log("GSA provisioning complete (rinfo=" + std::to_string(m_gsaRinfo) + ")");
 }
 
-Account AppStore::login_gsa(const std::string& /*email*/,
-                            const std::string& /*password*/,
-                            const std::string& /*authCode*/) {
-    // TODO:
-    //   AnisetteData ani = gsa_anisette();                 // provisions -2 on demand
-    //   GsaClient gsa(m_http, m_debug);
-    //   auto r = gsa.login(email, password, ani, authCode);// PET (or AuthCodeRequired / bad pw)
-    //   // native authenticate with password = r.pet (verbatim) → X-Token → Account
-    //   return do_login(email, r.pet, authCode, get_guid(), endpoint, *signer);
-    throw IpaError("login_gsa: not implemented yet");
+Account AppStore::login_gsa(const std::string& email,
+                            const std::string& password,
+                            const std::string& authCode) {
+    // 1. Grand Slam: SRP-6a → PET. gsa_anisette() provisions the -2 machine on
+    //    demand. 2FA is resolved entirely inside the GSA exchange — GsaClient
+    //    throws AuthCodeRequired when a code is needed (Apple has already pushed
+    //    it), and the GUI re-calls login_gsa with that code. Unlike the plain
+    //    native login, GSA tells a wrong password apart from a real 2FA prompt
+    //    (ec -22421 → IpaError("Bad Apple ID or password")), so the user isn't
+    //    nudged toward a code request that would burn an attempt.
+    AnisetteData ani = gsa_anisette();
+    GsaClient gsa(gsa_http(), m_debug);
+    GsaClient::Result r = gsa.login(email, password, ani, authCode);
+
+    // 2. Native authenticate with the PET as the password — passed verbatim, it
+    //    already carries Apple's trailing "PET" tag. This is the ordinary native
+    //    sign-in path (bag → SAP signing → reactive store/DSID-1 provisioning →
+    //    X-Token), so reuse it. No 2FA code here: the PET is already 2FA-complete,
+    //    and an empty authCode keeps do_login on attempt 1.
+    if (m_debug) prov_log("GSA: PET obtained, running native authenticate");
+    return login(email, r.pet, "", "");
 }
