@@ -1,0 +1,536 @@
+# ipatool-cpp
+
+A C++20 port of [ipatool](https://github.com/majd/ipatool) — a command-line tool for downloading iOS (and macOS) app packages from the App Store.
+Uses **libcurl** for networking and a small **Unicorn Engine** sandbox to run Apple's FairPlay code for request signing and package decryption. Builds on **Windows (VS 2022)**, Linux, and macOS, with optional fully static binaries.
+
+> C++20 is required. Text formatting uses a small dependency-free `ipt::format()` (see `compat_format.h`), so there is **no `std::format` / fmtlib dependency** and no toolchain-version caveats around `<format>`.
+
+---
+
+## What it does
+
+- Authenticates with the App Store and downloads apps you own as `.ipa` (iOS) or decrypted `.pkg` (macOS).
+- Signs every authentication request with an Apple **SAP action signature** (`X-Apple-ActionSignature`), required by the modern App Store protocol.
+- Generates a **kbsync** blob locally and uses it to sign the `volumeStoreDownloadProduct` download request, with a `redownloadProduct → updateProduct` fallback cascade.
+- Decrypts encrypted macOS `.pkg` downloads.
+
+SAP signing, kbsync generation and `.pkg` decryption are done by emulating Apple's own obfuscated dylibs (`CoreFP`, `CommerceCore`, `CommerceKit`, `storeagent`) inside a Unicorn x86-64 sandbox — no Apple binaries run natively on the host. Those asset files live in `sap_assets/` and are embedded into the executable at build time.
+
+---
+
+## Security model
+
+ipatool-cpp protects your Apple ID credentials using machine-bound encryption — the account file is tied to the machine it was created on and cannot be decrypted elsewhere.
+
+**Account file encryption:**
+- Credentials are always encrypted with AES-256-GCM — plaintext storage is not supported
+- File format version `0x02` — older formats are rejected with a clear re-login message
+- Encryption key: `PBKDF2-SHA256(machine_id + "nice_key_is_nice" + passphrase, random_salt, 100000, 32)`
+- `passphrase` is `""` if `--keychain-passphrase` is not provided — machine binding alone is sufficient
+- Copying the account file to another machine produces an unreadable file
+
+**Machine ID derivation (per platform):**
+- **Windows**: `SHA256(ProductId + MachineGuid)` — from `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion` and `HKLM\SOFTWARE\Microsoft\Cryptography`
+- **Linux**: `SHA256(machine-id + product_uuid)` — from `/etc/machine-id` and `/sys/class/dmi/id/product_uuid`
+- **macOS**: `SHA256(IOPlatformSerialNumber + IOPlatformUUID)` — via IOKit
+
+**In-memory protection:**
+- Sensitive fields (`passwordToken`, `password`) are AES-256-GCM encrypted in RAM at all times using `SecureString` (`protect.cpp`)
+- The in-memory key is **never stored** — it is derived fresh on every encrypt/decrypt call: `SHA256(get_machine_id() + "nice_key_is_nice" + passphrase)`
+- After each use the key is immediately wiped via `secure_zero()` (`SecureZeroMemory` on Windows, `memset_s` on macOS, `explicit_bzero` on Linux)
+- Plaintext exists only for microseconds during HTTP requests, then is wiped
+
+**Device identity:**
+- Every request carries a GUID derived from the machine's real physical MAC address (`device_mac.cpp`); the SAP / StoreAgent emulation is seeded with the same bytes
+- Placeholder / virtual MACs (all-zero, `02:00:00:00:00:00`, broadcast, multicast, `AA:BB:CC:DD:EE:FF`) are rejected so signing stays consistent — see notes on macOS below
+- Grand Slam (GSA) sign-in presents a local software-anisette machine (emulated CoreADI, no `anisette.exe` or public server). In your Apple ID device list it appears as a **Mac Pro** (`MacPro3,1`, macOS 10.12.6) — a deliberately recognizable placeholder model, not your real hardware. The serial is generated, not your device's.
+
+**`--keychain-passphrase`:**
+- Optional second factor on top of machine binding — use the same value on every command after login
+- Without it, machine binding alone protects the account file
+
+---
+
+## Dependencies
+
+| Dependency | Purpose |
+|------------|---------|
+| libcurl | HTTPS networking (Schannel on Windows, mbedTLS elsewhere) |
+| mbedTLS (`libmbedcrypto`) | AES-256-GCM, SHA-256, MD5, PBKDF2, HMAC, secure RNG |
+| nlohmann-json | iTunes Search/Lookup JSON parsing |
+| Unicorn Engine | x86-64 sandbox for SAP signing / kbsync / .pkg decryption |
+| minizip *(optional)* | IPA repacking (falls back to a plain copy if absent) |
+
+> The app's own crypto (account-file and in-memory encryption) uses mbedTLS's
+> `libmbedcrypto`. On Windows curl uses the system **Schannel** TLS, so only
+> `mbedcrypto` is linked there (not `libmbedtls` / `libmbedx509`); on Linux/macOS
+> curl uses **mbedTLS** as its TLS backend too. mbedTLS ships pre-generated
+> sources, so **neither Perl nor Python** is needed to build it.
+
+The SAP asset dylibs are not a package — they ship in `sap_assets/` in the repo and are embedded at build time (objcopy on Linux, RC resources on Windows, or loaded from the folder in development builds).
+
+---
+
+## Building on Windows (Visual Studio 2022)
+
+### Step 1 — Install vcpkg (once)
+
+```cmd
+git clone https://github.com/microsoft/vcpkg C:\vcpkg
+C:\vcpkg\bootstrap-vcpkg.bat
+setx VCPKG_ROOT C:\vcpkg
+```
+
+Restart your terminal after setting the variable.
+
+### Step 2a — Dynamic build (default)
+
+```cmd
+C:\vcpkg\vcpkg install curl:x64-windows nlohmann-json:x64-windows minizip:x64-windows mbedtls:x64-windows
+
+cmake -B build -G "Visual Studio 17 2022" -A x64 ^
+      -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake
+cmake --build build --config Release
+```
+
+> **Unicorn is no longer a vcpkg dependency on MSVC** — it's built from source (x86 only) during the first configure. That's smaller than the vcpkg package (which ships all ~16 QEMU targets) and, in practice, faster. Any `unicorn` already installed in vcpkg is ignored.
+
+Output: `build\Release\ipatool.exe`
+Requires `MSVCP140.dll` / `VCRUNTIME140.dll` on the target machine (included with the VS redistributable).
+
+### Step 2b — Fully static build (no DLL dependencies)
+
+```cmd
+C:\vcpkg\vcpkg install curl:x64-windows-static nlohmann-json:x64-windows-static minizip:x64-windows-static mbedtls:x64-windows-static
+
+rmdir /s /q build
+
+cmake -B build -G "Visual Studio 17 2022" -A x64 ^
+      -DCMAKE_TOOLCHAIN_FILE=C:\vcpkg\scripts\buildsystems\vcpkg.cmake ^
+      -DSTATIC_BUILD=ON ^
+      -DVCPKG_TARGET_TRIPLET=x64-windows-static
+cmake --build build --config Release
+```
+
+Output: `build\Release\ipatool.exe` — depends only on permanent Windows system DLLs (`KERNEL32.dll`, `WS2_32.dll`, `CRYPT32.dll`, `ADVAPI32.dll`, …). No redistributables needed.
+
+> **Note:** Always delete `build\` before switching between dynamic and static builds.
+>
+> **Performance:** the emulated FairPlay init is heavy. Build **Release**, not Debug — a debug build (which also compiles the from-source Unicorn without optimization) is dramatically slower (kbsync generation can go from seconds to minutes).
+
+### Step 3 (alternative) — Open in Visual Studio 2022 directly
+
+1. **File → Open → Folder** — select the project folder
+2. VS detects `CMakeLists.txt` automatically
+3. **Project → CMake Settings** → add CMake variable `CMAKE_TOOLCHAIN_FILE` = `C:\vcpkg\scripts\buildsystems\vcpkg.cmake`
+4. Save, let CMake configure, then **Build → Build All**
+
+---
+
+## Building on Windows (MSYS2 MinGW-w64 — single-file static)
+
+Builds a **fully static, self-contained `ipatool.exe`** with GCC — no third-party
+DLLs, runs on any Windows (incl. Windows 7). Unicorn is built from source here too
+(by GCC), so the FairPlay emulation (kbsync) is fast — on par with the MSVC
+from-source build.
+
+From an **MSYS2 MINGW64** shell:
+
+```sh
+pacman -S mingw-w64-x86_64-{gcc,cmake,ninja,minizip,zlib,bzip2,nlohmann-json}
+
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON
+cmake --build build
+# Output: build/ipatool.exe
+```
+
+What the build does automatically:
+- Builds a **minimal curl from source** using Windows' native **Schannel** TLS
+  (`HTTP_ONLY`), so curl needs no separate TLS library and none of
+  brotli/zstd/idn2/psl/libssh2/nghttp2/3/ngtcp2.
+- Builds **mbedTLS from source** and statically links `libmbedcrypto` for the
+  app's own crypto (AES-256-GCM / SHA-256 / MD5 / PBKDF2 / RNG).
+- Builds **Unicorn (x86-only) from source** with GCC → fast, static.
+- Statically links minizip, zlib and bzip2, plus
+  `-static -static-libgcc -static-libstdc++`.
+
+No Perl or Python is needed — curl uses Schannel, and mbedTLS ships
+pre-generated sources. Verify the result is self-contained:
+
+```sh
+ldd build/ipatool.exe | grep -iv 'windows\|system32'   # should print nothing
+```
+
+---
+
+## Building on Linux
+
+### Dynamic build
+
+```sh
+sudo apt install libcurl4-openssl-dev nlohmann-json3-dev libminizip-dev libmbedtls-dev libunicorn-dev
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+# Output: build/ipatool
+```
+
+> `libunicorn-dev` is optional and not reliably packaged on Ubuntu — on 22.04
+> (jammy) it is **not published** even with the **universe** component enabled
+> (`apt-cache policy libunicorn-dev` shows no candidate). If `apt` can't find it,
+> just drop it from the `apt install` line: the build then compiles Unicorn 2.x
+> from source automatically (~30 s). Debian and newer Ubuntu releases that do
+> ship `libunicorn-dev` are picked up when present. On older distros whose
+> `libmbedtls-dev` predates the CMake config package, mbedTLS is still found by
+> hand — no action needed.
+
+### Fully static build
+
+```sh
+sudo apt install libminizip-dev zlib1g-dev libunicorn-dev
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON
+cmake --build build
+# Output: build/ipatool
+```
+
+> **Stripping is automatic.** Every `Release` build strips the final binary after
+> linking (on macOS it is also re-signed ad-hoc, since stripping invalidates the
+> signature — required on Apple silicon). No manual `strip` step is needed; pass
+> `-DSTRIP_BINARY=OFF` to keep symbols. MSVC is unaffected — its debug info goes
+> to a separate PDB.
+
+The static build compiles **curl (HTTPS-only) and mbedTLS from source** via CMake
+`ExternalProject_Add` — curl uses mbedTLS as its TLS backend and the app crypto links
+the same `libmbedcrypto`, so no system `libmbedtls-dev` is needed. Verify with
+`ldd build/ipatool` — should show only `linux-vdso.so.1`, `libc.so.6`,
+`ld-linux-x86-64.so.2` (plus libunicorn if a static one wasn't found).
+
+---
+
+## Building on macOS
+
+> **Package manager:** the examples below use Homebrew. On older macOS releases
+> that current Homebrew no longer supports, use **MacPorts** instead — every
+> `brew install X` has a `sudo port install X` equivalent, shown under each
+> block. Two names differ: `pkg-config` → `pkgconfig`, and mbedTLS → `mbedtls3`
+> (the 3.x port; the 2.x `mbedtls` port also builds, thanks to the 2.x/3.x
+> compatibility shim). For a **dynamic** build with MacPorts add
+> `-DCMAKE_PREFIX_PATH=/opt/local` so CMake finds `/opt/local` libraries. For a
+> **static** build you only need `nlohmann-json` and `pkgconfig` — curl, mbedTLS,
+> minizip and Unicorn are all compiled from source.
+
+```sh
+brew install curl nlohmann-json minizip mbedtls unicorn
+# MacPorts: sudo port install curl nlohmann-json minizip mbedtls3 unicorn
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+IOKit and CoreFoundation are built into macOS — no extra dependencies needed for machine ID.
+
+### Native arm64 build (Apple silicon)
+
+```sh
+brew install mbedtls minizip nlohmann-json unicorn pkg-config
+# MacPorts: sudo port install mbedtls3 minizip nlohmann-json unicorn pkgconfig
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_OSX_ARCHITECTURES=arm64
+cmake --build build
+```
+
+> This dynamic build targets the machine it's built on, so no
+> `-DCMAKE_OSX_DEPLOYMENT_TARGET` is set — it links against the Homebrew
+> libraries as they are. (Set a deployment target only for the static builds
+> below, which are meant to run on older macOS versions.)
+>
+> On Apple silicon, target **native arm64** rather than an Intel (x86-64) host
+> binary. This is a CPU-architecture choice, independent of the dynamic-vs-static
+> options below. Unicorn emulates the x86-64 guest dylibs regardless of the host
+> architecture, so an Intel host binary buys nothing — and run under Rosetta it
+> double-emulates Unicorn's JIT and is many times slower. (On a real Intel Mac,
+> use the Intel section below instead.)
+
+### Static build (Apple silicon, arm64)
+
+```sh
+brew install nlohmann-json pkg-config
+# MacPorts: sudo port install nlohmann-json pkgconfig
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
+      -DCMAKE_OSX_ARCHITECTURES=arm64 \
+      -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+cmake --build build
+```
+
+`11.0` is the oldest macOS that runs on Apple silicon, so this binary runs on
+every Apple silicon Mac. The deployment target no longer affects text
+formatting (the project uses its own `ipt::format()`, not `std::format`), so
+you may raise or lower it freely within Apple silicon's supported range.
+
+> **curl, mbedTLS, minizip and Unicorn are built from source** for the static
+> build, targeting the same arch and deployment target, so Homebrew's `mbedtls`,
+> `minizip` and `unicorn` are *not* needed (a Homebrew `unicorn` is a `.dylib`,
+> which can't go into a fully static binary, so the build always recompiles it as
+> a `.a`). This also avoids Homebrew's bottles — compiled for the build machine's
+> macOS — producing "built for newer macOS version" linker warnings and an
+> unclean `minos`. The first configure downloads and compiles them (a few
+> minutes, cached afterwards); override the versions with
+> `-DMBEDTLS_VERSION=<x.y.z>` / `-DZLIB_VERSION=<x.y.z>` if desired. minizip
+> links against the system `libz` (present on every Mac).
+
+### Static build on macOS Catalina (Intel)
+
+```sh
+brew install nlohmann-json pkg-config
+# MacPorts: sudo port install nlohmann-json pkgconfig
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release -DSTATIC_BUILD=ON \
+      -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+      -DCMAKE_OSX_DEPLOYMENT_TARGET=10.15
+cmake --build build
+```
+
+CMake downloads and builds a minimal curl from source (HTTPS only, mbedTLS backend) and statically links it with mbedTLS, minizip and Unicorn (all compiled from source — `unicorn` from Homebrew is a `.dylib` and isn't used). System frameworks (`IOKit`, `CoreFoundation`, `SystemConfiguration`, `CoreServices`) and `libz` remain dynamic — they ship with every Mac. Run `otool -L build/ipatool` to confirm.
+
+---
+
+## Usage
+
+```
+ipatool [global flags] <command> [flags]
+
+Commands:
+  auth login            Authenticate with the App Store
+  auth info             Show currently saved account info
+  auth revoke           Delete saved credentials
+  search                Search for apps on the App Store
+  purchase              Acquire a free app license
+  list-purchases        List the account's purchase history
+  download              Download an app IPA / macOS pkg
+  list-versions         List available versions of an app
+  get-version-metadata  Get metadata for a specific app version
+  kbsync                Generate the kbsync blob locally (diagnostic; no request to Apple)
+
+Global flags:
+  --format text|json        Output format: human-readable text (default) or JSON
+  --keychain-passphrase     Optional additional passphrase for account file encryption
+  --debug                   Print full request/response dumps (headers + body; secrets masked)
+
+download flags:
+  -b / --bundle-id          Bundle identifier of the app
+  -i / --app-id             Numeric App Store ID (skips iTunes lookup)
+  -o / --output             Output file or directory path
+  --external-version-id     Download a specific older version
+  --purchase                Acquire license automatically if needed, then download
+
+kbsync flags:
+  --dsid DSID               Generate for an explicit DSID (diagnostic; ignores the cache)
+  --refresh                 Force regeneration and refresh the cached blob
+```
+
+---
+
+### Commands
+
+#### `auth login`
+```
+ipatool auth login -e EMAIL -p PASSWORD [--auth-code CODE] [--keychain-passphrase PASSPHRASE]
+```
+Authenticates with the App Store and saves credentials to `~/.ipatool/account`. Every authenticate request is SAP-signed; login is refused if the bag has no usable SAP configuration. If 2FA is enabled and `--auth-code` is omitted, you are prompted interactively.
+
+#### `auth info`
+```
+ipatool auth info [--keychain-passphrase PASSPHRASE]
+```
+Displays the name, email and storefront country of the saved account.
+
+#### `auth revoke`
+```
+ipatool auth revoke
+```
+Deletes the saved credentials file (`~/.ipatool/account`).
+
+#### `search`
+```
+ipatool search <term> [-l LIMIT] [--keychain-passphrase PASSPHRASE]
+```
+Searches the App Store. Default limit is 5.
+
+#### `purchase`
+```
+ipatool purchase (-b BUNDLE_ID | -i APP_ID) [-f|--force] [--keychain-passphrase PASSPHRASE]
+```
+Acquires a free license. Must be run once before downloading any app not already in your library.
+
+- `-f` / `--force` — only with `-i APP_ID`. The app lookup normally runs first and aborts the purchase if it fails. A developer may have pulled the app from the storefront, so the lookup 404s even though the license is still acquirable by its known id. With `--force` the failed lookup is tolerated and `buyProduct` is attempted anyway (it only needs the numeric id). Has no effect with `-b`, where the lookup is the only way to resolve the id.
+
+#### `list-purchases`
+```
+ipatool list-purchases [--range YEAR-all] [--all] [--since-year Y] [--keychain-passphrase PASSPHRASE]
+```
+Lists the account's purchase history — every purchase, including apps later pulled from the store (the data comes from the commerce invoice API, `/commerce/account/purchases`, not the owned-apps list, so delisted titles are kept). No anisette headers are needed; the session cookies plus `X-Token` / `X-Dsid` / storefront authorize the request, and pages are fetched until the response reports `is-complete`.
+
+- default (no flags) — the last 90 days.
+- `--range YEAR-all` — one calendar year, e.g. `--range 2011-all`.
+- `--all` — the full history, iterating every year from `--since-year` up to the current year and merging the results (duplicate invoices are de-duplicated by order ID; repeated purchases of the same app are all kept).
+- `--since-year Y` — lower bound for `--all` (default `2008`, the year the App Store launched).
+
+Each entry carries `id` (App Store ID), `name`, `price` (with currency), `purchaseDate`, and `kind` (`iOS App`, `Book`, …). With `--format json` the same `{count, apps:[…]}` object is emitted as one compact JSON line, convenient as a log for further processing.
+
+#### `download`
+```
+ipatool download (-b BUNDLE_ID | -i APP_ID) [-o OUTPUT] [--external-version-id ID] [--purchase] [--keychain-passphrase PASSPHRASE]
+```
+Downloads an app as an `.ipa` (iOS) or decrypted `.pkg` (macOS).
+
+- `-b` performs an iTunes lookup first; `-i` skips it and uses the numeric App Store ID directly
+- The download runs a stateless cascade over the bag's endpoints — `volumeStoreDownloadProduct` (with a cached/generated **kbsync**) → `redownloadProduct` → `updateProduct` — and takes the first that serves the app
+- `--external-version-id` downloads a specific older version (get IDs from `list-versions`)
+- `-o` can be a file path or a directory; defaults to the current directory
+- `--purchase` acquires the license if needed, then downloads
+- Output filename format: `{bundleDisplayName} {version}.ipa` (or `.pkg` for macOS) — a space before the version, matching iTunes. The name is the `bundleDisplayName` from the download response (numeric App Store ID is not part of it); with an explicit `-o FILE` the path is used verbatim, no extension added
+- Resumable — re-running the same command continues an interrupted download
+- The finished file is verified against the store's `md5`. A mismatch (only possible on a fully received transfer — partial transfers resume instead) discards the file and re-downloads it once from scratch; if it still fails, the command aborts and leaves no corrupt `.tmp` behind. On a match the download is reported back to Apple (`songDownloadDone`), as iTunes/Configurator does — best-effort, never fails the download
+- iOS IPAs are patched to iTunes format (`iTunesMetadata.plist`, `iTunesArtwork`, sinf DRM token injected into `SC_Info/`); encrypted macOS `.pkg` files are decrypted via the StoreAgent sandbox
+
+#### `list-versions`
+```
+ipatool list-versions (-b BUNDLE_ID | -i APP_ID) [--purchase] [--keychain-passphrase PASSPHRASE]
+```
+Returns all available external version IDs for an app.
+- `--purchase` acquires the (free) license first if the app isn't yet in your library, then lists versions. Without it, an app you don't own returns a "must purchase" error.
+
+#### `get-version-metadata`
+```
+ipatool get-version-metadata (-b BUNDLE_ID | -i APP_ID) --external-version-id ID [--keychain-passphrase PASSPHRASE]
+```
+Returns the display version string, release date and, when it can be determined, the minimum OS version for a specific version ID.
+
+- `minimumOSVersion` is read directly from the app package, since the store metadata does not carry it:
+  - **iOS (`.ipa`)** — `Payload/<App>.app/Info.plist` → `MinimumOSVersion`. The field is pulled with a few HTTP range requests against the download URL (reading only the ZIP central directory and that one entry), so the whole IPA is **not** downloaded.
+  - **macOS (preflight package)** — the small `preflightPackageURL` (a XAR) is fetched whole; its `Distribution` XML gives `<allowed-os-versions><os-version min="…"/>`.
+- It is **best-effort**: on any problem (range unsupported, unexpected container, parse failure) the field is simply omitted — `displayVersion` and `releaseDate` are always returned. In `--format json` the key `minimumOSVersion` appears only when a value was found.
+
+#### `kbsync`
+```
+ipatool kbsync [--dsid DSID] [--refresh] [--keychain-passphrase PASSPHRASE]
+```
+Diagnostic command that generates the kbsync blob locally through the FairPlay emulation — **no request is sent to Apple**. Prints length, header bytes and base64.
+
+- With no `--dsid`: uses the saved account's DSID and the cached blob (`source=cache`); on a cache miss it generates once (~15–60 s+) and caches it in the account file
+- `--refresh`: forces regeneration and updates the cache
+- `--dsid N`: pure generation test for an explicit DSID — neither reads nor writes the cache
+- A valid blob is a few hundred bytes and starts with `00 04 00 03`
+
+> The first generation is slow because Apple's obfuscated `FairPlayGlobalContextInit` is heavy under emulation. The result is cached in the account file (bound to DSID + hardware, surviving token refreshes) and only regenerated when the server rejects it — so you pay this cost rarely.
+
+---
+
+## Typical workflow
+
+```sh
+# 1. Log in (credentials encrypted with machine binding)
+ipatool auth login -e you@example.com -p yourpassword
+
+# 2. Check saved account
+ipatool auth info
+
+# 3. Search for an app
+ipatool search "minecraft" -l 5
+
+# 4. Acquire license and download in one step
+ipatool download -b com.mojang.minecraft-edu --purchase -o ~/Downloads
+
+# 5. Or download by numeric app ID (skips the iTunes lookup)
+ipatool download -i 1440285423 --purchase -o ~/Downloads
+
+# 6. List available older versions, then download one
+ipatool list-versions -b com.mojang.minecraft-edu
+ipatool download -b com.mojang.minecraft-edu --external-version-id 123456789 -o ~/Downloads
+
+# 7. List purchase history (last 90 days, one year, or everything)
+ipatool list-purchases
+ipatool list-purchases --range 2011-all
+ipatool list-purchases --all
+
+# 8. Revoke saved credentials
+ipatool auth revoke
+```
+
+---
+
+## Output formats
+
+Default output is human-readable text with colors (when stdout is a TTY):
+
+```
+10:32:15 INF name=John Appleseed email=john@example.com storefront=US success=true
+```
+
+With `--format json`:
+```json
+{"name":"John Appleseed","email":"john@example.com","storefront":"US","success":true}
+```
+
+(`auth login` and `auth info` include `storefront` — the account's country code.)
+
+Colors are disabled automatically when output is piped. On Windows 7/8 the legacy Console API is used for colors; on Windows 10+ ANSI escape codes are used.
+
+---
+
+## Stored files
+
+| File | Contents |
+|------|----------|
+| `~/.ipatool/account` | Apple ID credentials + cached kbsync — AES-256-GCM encrypted, machine-bound (format v2) |
+| `~/.ipatool/cookies` | Session cookies (Netscape format, written by the tool itself) |
+
+On Windows these are in `%USERPROFILE%\.ipatool\`. The account file is always encrypted; copy it to another machine and it cannot be decrypted — run `auth login` again.
+
+---
+
+## Notes
+
+- If you move to a new machine or reinstall the OS, run `auth revoke` + `auth login` again
+- Paid apps are not supported — only free apps and apps already in your account's library
+- `purchase` must be run before `download` for any app not in your library
+- Older versions obtained via `--external-version-id` may no longer be signed by Apple and might not install
+- Session token expiry is handled automatically — the tool re-authenticates silently using stored credentials (2FA prompts once). The cached kbsync is preserved across such token refreshes
+- `--debug` dumps full request/response headers and bodies; `X-Token` is masked and the login password is masked in the authenticate dump
+
+---
+
+## Source layout
+
+**CLI & shared types**
+- `main.cpp` — CLI entry point, argument parsing, all commands, account-file AES-GCM encryption, kbsync cache
+- `ipatool.h` — shared types (`Account` incl. cached `kbsync`, `App`, `Sinf`), endpoints, error types
+- `protect.cpp/.h` — `SecureString` in-memory encryption, `secure_zero`, and `secure_random` (mbedTLS CTR_DRBG + entropy)
+
+**App Store protocol**
+- `appstore.cpp/.h` — bag fetch, SAP-signed login, search/lookup, purchase, list-purchases (paginated commerce invoice API), download (`volumeStoreDownloadProduct → redownloadProduct → updateProduct` cascade), list-versions, version metadata, storefront↔country table, iTunes JSON parsing
+- `http_client.cpp/.h` — libcurl wrapper (GET/POST, resumable download, custom cookie file I/O via `CURLOPT_COOKIELIST`)
+- `plist.cpp/.h` — Apple plist XML + binary encoder/decoder (no external deps)
+
+**Device identity & crypto**
+- `device_mac.cpp/.h` — stable physical MAC / GUID / hardware ID (IOKit `en0` on macOS, `GetIfTable2` on Windows, sysfs on Linux) with placeholder-MAC rejection
+- `hwid.cpp/.h` — machine-ID derivation and PBKDF2 file-key derivation
+- `aes.cpp/.h` — AES-256-GCM (mbedTLS `mbedtls_gcm_*`)
+- `sha2.cpp/.h` — SHA-256, HMAC, PBKDF2 (mbedTLS `mbedtls_sha256` / `mbedtls_md_hmac` / `mbedtls_pkcs5_pbkdf2_hmac_ext`)
+
+**FairPlay emulation (Unicorn x86-64)**
+- `SapSigner.cpp/.h` — SAP action-signature signer (init/exchange/sign), `SapBase64`, `LocalHardwareID`
+- `SapMachine.cpp/.h` — Unicorn runtime for `CoreFP`/`CommerceCore`/`CommerceKit` and the syscall/library shims (`SapShims`)
+- `StoreAgentMachine.cpp/.h` — Unicorn runtime for `storeagent`: `FairPlayGlobalContextInit`, `.pkg` chunk decryption, and `FairPlayKBSyncDataWithDSID` (kbsync)
+- `MachImage.cpp/.h` — Mach-O 64 loader/relocator (segments, binds, rebases) for the sandbox
+- `sap_embedded_assets.h` — accessor for the SAP dylibs embedded via objcopy (Linux/ELF)
+- `sap_resources.h` — resource IDs for the SAP dylibs embedded as Windows RC data
+
+**Misc**
+- `compat_format.h` — dependency-free `ipt::format()` (`{}` / `{:#x}`) used for diagnostics; no `std::format` / fmtlib
+- `CMakeLists.txt` — cross-platform build (vcpkg + static support + asset embedding)
+- `sap_assets/` — Apple FairPlay dylibs embedded at build time (not tracked for redistribution)
+```

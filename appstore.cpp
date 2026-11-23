@@ -1,0 +1,3764 @@
+#include "appstore.h"
+#include "SapSigner.h"   // SAP signing (v2.4.0+) + SapBase64
+#include "device_mac.h"  // device MAC / GUID
+#include "StoreAgentMachine.h"
+#include "plist.h"       // PlistValue / encode_plist_xml / decode_plist / base64_*
+#include "sha2.h"        // sha2::digest — GSA identity LU
+#include "protect.h"     // secure_random — GSA identity seed
+#include "apple_ca.h"    // APPLE_GSA_CA_BUNDLE — gsa.apple.com trust anchor
+#include <span>
+#include <utility>
+#include <thread>
+#include <chrono>
+#include <fstream>
+#include <set>
+#include <sstream>
+#include <functional>
+#include <iterator>
+#include <stdexcept>
+#include <cstring>
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>       // std::getenv (IPATOOL_ADI_EAGER_FP)
+#include <fstream>
+#include <filesystem>   // C++17 — replaces getcwd / stat / S_ISDIR
+#include <regex>
+#include <random>
+#include <ctime>
+#include <cstdint>
+#include <zlib.h>        // raw inflate for the range-read Info.plist (min-OS)
+#include <mbedtls/version.h> // MBEDTLS_VERSION_MAJOR (TLS-version backend select)
+// MD5 for whole-image download verification. 4.x removed the legacy mbedtls_md5
+// module (crypto moved to PSA), so there we go through psa_hash_*; 2.x/3.x keep
+// the low-level API, with a shim for the 2.x "_ret" suffix.
+#if MBEDTLS_VERSION_MAJOR >= 4
+#  include <psa/crypto.h>
+#else
+#  include <mbedtls/md5.h>
+#  if MBEDTLS_VERSION_MAJOR < 3
+#    define mbedtls_md5_starts mbedtls_md5_starts_ret
+#    define mbedtls_md5_update mbedtls_md5_update_ret
+#    define mbedtls_md5_finish mbedtls_md5_finish_ret
+#  endif
+#endif
+
+// ── Platform headers ──────────────────────────────────────────────────────────
+
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <iphlpapi.h>
+#  if defined(_MSC_VER)
+// MSVC auto-links via these pragmas; MinGW/GCC links the same libs through CMake.
+#    pragma comment(lib, "iphlpapi.lib")
+#    pragma comment(lib, "ws2_32.lib")
+#  endif
+#else
+#  include <sys/socket.h>
+#  include <sys/ioctl.h>
+#  include <net/if.h>
+#  include <ifaddrs.h>
+#  ifdef __linux__
+#    include <netpacket/packet.h>
+#  elif defined(__APPLE__)
+#    include <net/if_dl.h>
+#  endif
+#endif
+
+// ── minizip for cross-platform ZIP writing ────────────────────────────────────
+
+#ifdef HAVE_MINIZIP
+#  include <minizip/zip.h>
+#  include <minizip/unzip.h>
+#  ifdef _WIN32
+#    include <share.h>   // _SH_DENYNO for _wfsopen
+#  endif
+#endif
+
+#include "path_utf8.h"   // ipt::fs_path / ipt::utf8_to_wide — Unicode paths on Windows
+#ifdef _WIN32
+#  include <io.h>        // _isatty / _fileno — for routing --debug output to WriteConsoleW
+#endif
+
+namespace fs = std::filesystem;
+
+#ifdef HAVE_MINIZIP
+// minizip's default ioapi opens files with the narrow CRT fopen, which mangles
+// non-ASCII (e.g. Cyrillic) paths on Windows. On Windows route zip/unzip through
+// our own wide-char file functions with a UTF-16 path; elsewhere the plain
+// UTF-8 path works natively.
+//
+// minizip's iowin32.h is deliberately not used: since vcpkg minizip 1.3.2 it is
+// only installed with the deprecated "unofficial-iowin32" feature, and other
+// minizip packages may not ship it at all. These callbacks only need the CRT.
+#  ifdef _WIN32
+namespace {
+
+voidpf ZCALLBACK wopen64(voidpf, const void* filename, int mode) {
+    const wchar_t* m = nullptr;
+    if ((mode & ZLIB_FILEFUNC_MODE_READWRITEFILTER) == ZLIB_FILEFUNC_MODE_READ)
+        m = L"rb";
+    else if (mode & ZLIB_FILEFUNC_MODE_EXISTING)
+        m = L"r+b";
+    else if (mode & ZLIB_FILEFUNC_MODE_CREATE)
+        m = L"wb";
+    if (!filename || !m) return nullptr;
+    // _wfsopen with _SH_DENYNO shares like plain fopen (no MSVC C4996 either).
+    return _wfsopen(static_cast<const wchar_t*>(filename), m, _SH_DENYNO);
+}
+
+uLong ZCALLBACK wread(voidpf, voidpf stream, void* buf, uLong size) {
+    return static_cast<uLong>(std::fread(buf, 1, size, static_cast<FILE*>(stream)));
+}
+
+uLong ZCALLBACK wwrite(voidpf, voidpf stream, const void* buf, uLong size) {
+    return static_cast<uLong>(std::fwrite(buf, 1, size, static_cast<FILE*>(stream)));
+}
+
+ZPOS64_T ZCALLBACK wtell64(voidpf, voidpf stream) {
+    __int64 pos = _ftelli64(static_cast<FILE*>(stream));
+    return pos < 0 ? static_cast<ZPOS64_T>(-1) : static_cast<ZPOS64_T>(pos);
+}
+
+long ZCALLBACK wseek64(voidpf, voidpf stream, ZPOS64_T offset, int origin) {
+    int whence;
+    switch (origin) {
+        case ZLIB_FILEFUNC_SEEK_CUR: whence = SEEK_CUR; break;
+        case ZLIB_FILEFUNC_SEEK_END: whence = SEEK_END; break;
+        case ZLIB_FILEFUNC_SEEK_SET: whence = SEEK_SET; break;
+        default: return -1;
+    }
+    return _fseeki64(static_cast<FILE*>(stream), static_cast<__int64>(offset), whence) == 0
+               ? 0 : -1;
+}
+
+int ZCALLBACK wclose(voidpf, voidpf stream) {
+    return std::fclose(static_cast<FILE*>(stream));
+}
+
+int ZCALLBACK werror(voidpf, voidpf stream) {
+    return std::ferror(static_cast<FILE*>(stream));
+}
+
+zlib_filefunc64_def wide_filefunc() {
+    zlib_filefunc64_def ff{};
+    ff.zopen64_file = wopen64;
+    ff.zread_file   = wread;
+    ff.zwrite_file  = wwrite;
+    ff.ztell64_file = wtell64;
+    ff.zseek64_file = wseek64;
+    ff.zclose_file  = wclose;
+    ff.zerror_file  = werror;
+    ff.opaque       = nullptr;
+    return ff;
+}
+
+} // namespace
+#  endif
+
+static unzFile ipt_unzOpen(const std::string& path) {
+#  ifdef _WIN32
+    zlib_filefunc64_def ff = wide_filefunc();
+    std::wstring w = ipt::utf8_to_wide(path);
+    return unzOpen2_64(reinterpret_cast<const void*>(w.c_str()), &ff);
+#  else
+    return unzOpen(path.c_str());
+#  endif
+}
+static zipFile ipt_zipOpen(const std::string& path, int append) {
+#  ifdef _WIN32
+    zlib_filefunc64_def ff = wide_filefunc();
+    std::wstring w = ipt::utf8_to_wide(path);
+    return zipOpen2_64(reinterpret_cast<const void*>(w.c_str()), append, nullptr, &ff);
+#  else
+    return zipOpen(path.c_str(), append);
+#  endif
+}
+#endif
+
+#include "sap_resources.h"
+#include "sap_embedded_assets.h"
+
+// Lowercase hex MD5 of a whole file (streamed), used to verify a finished
+// download against the <key>md5</key> the store returns. "" on open/hash error.
+static std::string md5_file_hex(const std::string& path) {
+    FILE* f = ipt::fopen_utf8(path, "rb");
+    if (!f) return "";
+    std::vector<uint8_t> buf(1u << 20);  // 1 MiB chunks
+    size_t n;
+    unsigned char md[16];
+#if MBEDTLS_VERSION_MAJOR >= 4
+    static const psa_status_t initrc = psa_crypto_init(); (void)initrc;  // idempotent
+    psa_hash_operation_t ctx = PSA_HASH_OPERATION_INIT;
+    if (psa_hash_setup(&ctx, PSA_ALG_MD5) != PSA_SUCCESS) { fclose(f); return ""; }
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        if (psa_hash_update(&ctx, buf.data(), n) != PSA_SUCCESS) {
+            psa_hash_abort(&ctx); fclose(f); return "";
+        }
+    }
+    fclose(f);
+    size_t mdlen = 0;
+    if (psa_hash_finish(&ctx, md, sizeof(md), &mdlen) != PSA_SUCCESS || mdlen != sizeof(md))
+        return "";
+#else
+    mbedtls_md5_context ctx;
+    mbedtls_md5_init(&ctx);
+    if (mbedtls_md5_starts(&ctx) != 0) { mbedtls_md5_free(&ctx); fclose(f); return ""; }
+    while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) {
+        if (mbedtls_md5_update(&ctx, buf.data(), n) != 0) {
+            mbedtls_md5_free(&ctx); fclose(f); return "";
+        }
+    }
+    fclose(f);
+    mbedtls_md5_finish(&ctx, md);
+    mbedtls_md5_free(&ctx);
+#endif
+    static const char* hexd = "0123456789abcdef";
+    std::string out;
+    out.reserve(sizeof(md) * 2);
+    for (unsigned i = 0; i < sizeof(md); ++i) {
+        out.push_back(hexd[md[i] >> 4]);
+        out.push_back(hexd[md[i] & 0xF]);
+    }
+    return out;
+}
+
+// Lowercase hex MD5 of an in-memory buffer, for per-chunk integrity checks
+// (the store ships a <key>hashes</key> array of per-chunk md5s). "" on error.
+static std::string md5_buf_hex(const uint8_t* data, size_t len) {
+    unsigned char md[16];
+#if MBEDTLS_VERSION_MAJOR >= 4
+    static const psa_status_t initrc = psa_crypto_init(); (void)initrc;  // idempotent
+    size_t mdlen = 0;
+    if (psa_hash_compute(PSA_ALG_MD5, data, len, md, sizeof(md), &mdlen) != PSA_SUCCESS
+        || mdlen != sizeof(md))
+        return "";
+#else
+    mbedtls_md5_context ctx;
+    mbedtls_md5_init(&ctx);
+    if (mbedtls_md5_starts(&ctx) != 0 ||
+        mbedtls_md5_update(&ctx, data, len) != 0 ||
+        mbedtls_md5_finish(&ctx, md) != 0) {
+        mbedtls_md5_free(&ctx);
+        return "";
+    }
+    mbedtls_md5_free(&ctx);
+#endif
+    static const char* hexd = "0123456789abcdef";
+    std::string out;
+    out.reserve(sizeof(md) * 2);
+    for (unsigned i = 0; i < sizeof(md); ++i) {
+        out.push_back(hexd[md[i] >> 4]);
+        out.push_back(hexd[md[i] & 0xF]);
+    }
+    return out;
+}
+
+// Case-insensitive ASCII equality (md5 hex compare).
+static bool ascii_iequals(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i])) return false;
+    return true;
+}
+
+// Depth-first search for the per-chunk integrity manifest: the first dict in the
+// item tree that carries both an integer <key>chunkSize</key> and an array
+// <key>hashes</key>. The store may place it at the item's top level or nested
+// under some sub-key, so we don't hard-code a path. Returns true and fills
+// chunkSize/hashes on the first valid manifest found.
+static bool find_chunk_manifest(const PlistDict& d,
+                                int64_t& chunkSize,
+                                std::vector<std::string>& hashes) {
+    auto cs = d.find("chunkSize");
+    auto hs = d.find("hashes");
+    if (cs != d.end() && cs->second.isInt() &&
+        hs != d.end() && hs->second.isArray()) {
+        int64_t                  csv = cs->second.i64();
+        std::vector<std::string> hv;
+        for (auto& e : hs->second.arrayVal)
+            if (e.isString()) hv.push_back(e.strVal);
+        if (csv > 0 && !hv.empty()) {
+            chunkSize = csv;
+            hashes    = std::move(hv);
+            return true;
+        }
+    }
+    for (auto& kv : d) {
+        const PlistValue& v = kv.second;
+        if (v.isDict()) {
+            if (find_chunk_manifest(v.dictVal, chunkSize, hashes)) return true;
+        } else if (v.isArray()) {
+            for (auto& e : v.arrayVal)
+                if (e.isDict() && find_chunk_manifest(e.dictVal, chunkSize, hashes)) return true;
+        }
+    }
+    return false;
+}
+
+// Verify a finished raw download against the store's per-chunk md5 manifest
+// (<key>chunkSize</key> + <key>hashes</key>) and repair any corrupt chunk by
+// re-fetching only that byte range. chunkSize and the hash count are taken from
+// the response, so whatever chunking the store uses is handled. Returns true if
+// the file matches the manifest (possibly after repair); false if a chunk can't
+// be repaired or the file doesn't line up with the manifest, in which case the
+// caller falls back to the whole-file md5 path (full re-download).
+static bool verify_and_repair_chunks(const HttpClient& http,
+                                     const std::string& url,
+                                     const std::string& path,
+                                     int64_t chunkSize,
+                                     const std::vector<std::string>& hashes,
+                                     bool debug)
+{
+    if (chunkSize <= 0 || hashes.empty()) return true;  // no manifest → nothing to check
+
+    std::error_code ec;
+    const int64_t fileSize = (int64_t)fs::file_size(ipt::fs_path(path), ec);
+    if (ec) return false;
+
+    // The manifest must line up with the file: (n-1) full chunks plus a final
+    // chunk of 1..chunkSize bytes. If it doesn't fit, the download length itself
+    // is wrong — not a per-chunk repair job — so hand it to the whole-file path.
+    const int64_t n       = (int64_t)hashes.size();
+    const int64_t minSize = (n - 1) * chunkSize + 1;
+    const int64_t maxSize = n * chunkSize;
+    if (fileSize < minSize || fileSize > maxSize) {
+        if (debug)
+            fprintf(stderr, "[DEBUG] chunk manifest does not fit file "
+                    "(%lld bytes, %lld chunks of %lld) - skipping chunk repair\n",
+                    (long long)fileSize, (long long)n, (long long)chunkSize);
+        return false;
+    }
+
+    auto seek64 = [](FILE* f, int64_t off) -> bool {
+#if defined(_WIN32)
+        return _fseeki64(f, off, SEEK_SET) == 0;
+#else
+        return fseeko(f, (off_t)off, SEEK_SET) == 0;
+#endif
+    };
+
+    int repaired = 0;
+    std::vector<uint8_t> win;
+    for (int64_t i = 0; i < n; ++i) {
+        const int64_t off = i * chunkSize;
+        const int64_t len = std::min<int64_t>(chunkSize, fileSize - off);
+
+        // Read this chunk window from the file and md5 it.
+        FILE* f = ipt::fopen_utf8(path, "rb");
+        if (!f) return false;
+        if (!seek64(f, off)) { fclose(f); return false; }
+        win.resize((size_t)len);
+        size_t got = fread(win.data(), 1, (size_t)len, f);
+        fclose(f);
+        if ((int64_t)got != len) return false;
+
+        if (ascii_iequals(md5_buf_hex(win.data(), win.size()), hashes[i]))
+            continue;  // chunk is intact
+
+        // Corrupt chunk → re-fetch only this byte range and splice it back in.
+        if (debug)
+            fprintf(stderr, "[DEBUG] chunk %lld/%lld md5 mismatch - refetching range %lld-%lld\n",
+                    (long long)i, (long long)n, (long long)off, (long long)(off + len - 1));
+
+        std::string fresh;
+        if (!http.download_range(url, off, off + len - 1, fresh))
+            return false;  // transport dead or server misbehaved → whole-file fallback
+        if (!ascii_iequals(md5_buf_hex((const uint8_t*)fresh.data(), fresh.size()), hashes[i])) {
+            if (debug)
+                fprintf(stderr, "[DEBUG] chunk %lld still bad after refetch - falling back\n",
+                        (long long)i);
+            return false;  // re-fetched bytes still wrong → not recoverable here
+        }
+
+        FILE* w = ipt::fopen_utf8(path, "r+b");
+        if (!w) return false;
+        if (!seek64(w, off)) { fclose(w); return false; }
+        size_t wrote   = fwrite(fresh.data(), 1, fresh.size(), w);
+        int    flushed = fflush(w);
+        fclose(w);
+        if (wrote != fresh.size() || flushed != 0) return false;
+        ++repaired;
+    }
+
+    if (debug && repaired)
+        fprintf(stderr, "[DEBUG] chunk verify: repaired %d chunk(s)\n", repaired);
+    return true;
+}
+
+// Load a SAP dylib asset.
+// Priority: 1) Linux/macOS objcopy embedded  2) Windows RCDATA  3) file fallback
+static std::vector<uint8_t> load_sap_asset(const char* name) {
+#ifdef SAP_ASSETS_EMBEDDED
+    // Linux/macOS: symbols injected by objcopy --input binary
+    struct { const char* name; const uint8_t* start; const uint8_t* end; } kEmbed[] = {
+        { "CoreFP",       _binary_CoreFP_start,       _binary_CoreFP_end       },
+        { "CommerceCore", _binary_CommerceCore_start, _binary_CommerceCore_end },
+        { "CommerceKit",  _binary_CommerceKit_start,  _binary_CommerceKit_end  },
+        { "CoreFP.icxs",  _binary_CoreFP_icxs_start,  _binary_CoreFP_icxs_end  },
+        { "storeagent",   _binary_storeagent_start,   _binary_storeagent_end   },
+        { "CoreADI",      _binary_CoreADI_start,      _binary_CoreADI_end      },
+    };
+    for (auto& e : kEmbed) {
+        if (std::strcmp(e.name, name) == 0 && e.start && e.end > e.start)
+            return std::vector<uint8_t>(e.start, e.end);
+    }
+#elif defined(_WIN32)
+    // Windows: RCDATA resources compiled in via sap_resources.rc
+    static const struct { const char* name; int id; } kMap[] = {
+        { "CoreFP",       IDR_SAP_COREFP       },
+        { "CommerceCore", IDR_SAP_COMMERCECORE  },
+        { "CommerceKit",  IDR_SAP_COMMERCEKIT   },
+        { "CoreFP.icxs",  IDR_SAP_COREFP_ICXS  },
+        { "storeagent",   IDR_SAP_STOREAGENT    },
+        { "CoreADI",      IDR_SAP_COREADI       },
+    };
+    for (auto& e : kMap) {
+        if (std::strcmp(e.name, name) == 0) {
+            HRSRC hRes = FindResourceA(nullptr, MAKEINTRESOURCEA(e.id), RT_RCDATA);
+            if (hRes) {
+                HGLOBAL hMem = LoadResource(nullptr, hRes);
+                if (hMem) {
+                    DWORD   sz   = SizeofResource(nullptr, hRes);
+                    void*   data = LockResource(hMem);
+                    if (data && sz > 0)
+                        return std::vector<uint8_t>(
+                            static_cast<const uint8_t*>(data),
+                            static_cast<const uint8_t*>(data) + sz);
+                }
+            }
+            break;
+        }
+    }
+#endif
+
+    // Fallback: load from file (development / unsupported platform)
+    std::string path = std::string("sap_assets/") + name;
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw IpaError(std::string("SAP asset not found: ") + path +
+                           " (not embedded in binary and file missing)");
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(f),
+                                std::istreambuf_iterator<char>());
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Storefront -> country code
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct StorefrontEntry { const char* cc; const char* id; };
+
+static const StorefrontEntry STOREFRONT_TABLE[] = {
+    {"AE","143481"},{"AG","143540"},{"AI","143538"},{"AL","143575"},{"AM","143524"},
+    {"AO","143564"},{"AR","143505"},{"AT","143445"},{"AU","143460"},{"AZ","143568"},
+    {"BB","143541"},{"BD","143490"},{"BE","143446"},{"BG","143526"},{"BH","143559"},
+    {"BM","143542"},{"BN","143560"},{"BO","143556"},{"BR","143503"},{"BS","143539"},
+    {"BW","143525"},{"BY","143565"},{"BZ","143555"},{"CA","143455"},{"CH","143459"},
+    {"CI","143527"},{"CL","143483"},{"CN","143465"},{"CO","143501"},{"CR","143495"},
+    {"CY","143557"},{"CZ","143489"},{"DE","143443"},{"DK","143458"},{"DM","143545"},
+    {"DO","143508"},{"DZ","143563"},{"EC","143509"},{"EE","143518"},{"EG","143516"},
+    {"ES","143454"},{"FI","143447"},{"FR","143442"},{"GB","143444"},{"GD","143546"},
+    {"GE","143615"},{"GH","143573"},{"GR","143448"},{"GT","143504"},{"GY","143553"},
+    {"HK","143463"},{"HN","143510"},{"HR","143494"},{"HU","143482"},{"ID","143476"},
+    {"IE","143449"},{"IL","143491"},{"IN","143467"},{"IQ","143617"},{"IS","143558"},
+    {"IT","143450"},{"JM","143511"},{"JO","143528"},{"JP","143462"},{"KE","143529"},
+    {"KN","143548"},{"KR","143466"},{"KW","143493"},{"KY","143544"},{"KZ","143517"},
+    {"LB","143497"},{"LC","143549"},{"LI","143522"},{"LK","143486"},{"LT","143520"},
+    {"LU","143451"},{"LV","143519"},{"MD","143523"},{"MG","143531"},{"MK","143530"},
+    {"ML","143532"},{"MN","143592"},{"MO","143515"},{"MS","143547"},{"MT","143521"},
+    {"MU","143533"},{"MV","143488"},{"MX","143468"},{"MY","143473"},{"NE","143534"},
+    {"NG","143561"},{"NI","143512"},{"NL","143452"},{"NO","143457"},{"NP","143484"},
+    {"NZ","143461"},{"OM","143562"},{"PA","143485"},{"PE","143507"},{"PH","143474"},
+    {"PK","143477"},{"PL","143478"},{"PT","143453"},{"PY","143513"},{"QA","143498"},
+    {"RO","143487"},{"RS","143500"},{"RU","143469"},{"SA","143479"},{"SE","143456"},
+    {"SG","143464"},{"SI","143499"},{"SK","143496"},{"SN","143535"},{"SR","143554"},
+    {"SV","143506"},{"TC","143552"},{"TH","143475"},{"TN","143536"},{"TR","143480"},
+    {"TT","143551"},{"TW","143470"},{"TZ","143572"},{"UA","143492"},{"UG","143537"},
+    {"US","143441"},{"UY","143514"},{"UZ","143566"},{"VC","143550"},{"VE","143502"},
+    {"VG","143543"},{"VN","143471"},{"YE","143571"},{"ZA","143472"},
+};
+
+std::string country_code_from_storefront(const std::string& sf) {
+    // storefront looks like "143441-1,32" — first part before '-' is the numeric ID
+    std::string numeric = sf;
+    auto dash = sf.find('-');
+    if (dash != std::string::npos) numeric = sf.substr(0, dash);
+    auto comma = numeric.find(',');
+    if (comma != std::string::npos) numeric = numeric.substr(0, comma);
+
+    for (auto& entry : STOREFRONT_TABLE) {
+        if (numeric == entry.id) return entry.cc;
+    }
+    throw std::runtime_error("country code mapping for store front (" + sf + ") was not found");
+}
+
+// ── JSON parsing (iTunes Search/Lookup API responses) ─────────────────────────
+
+App app_from_json(const json& j) {
+    App a;
+    if (j.contains("trackId")   && j["trackId"].is_number())   a.id       = j["trackId"].get<int64_t>();
+    if (j.contains("bundleId")  && j["bundleId"].is_string())  a.bundleID = j["bundleId"].get<std::string>();
+    if (j.contains("trackName") && j["trackName"].is_string()) a.name     = j["trackName"].get<std::string>();
+    if (j.contains("version")   && j["version"].is_string())   a.version  = j["version"].get<std::string>();
+    if (j.contains("price")     && j["price"].is_number())     a.price    = j["price"].get<double>();
+    return a;
+}
+
+SearchResult parse_search_json(const std::string& body) {
+    SearchResult out;
+    try {
+        auto j = json::parse(body);
+        if (j.contains("resultCount") && j["resultCount"].is_number())
+            out.count = j["resultCount"].get<int>();
+        if (j.contains("results") && j["results"].is_array())
+            for (auto& item : j["results"])
+                out.results.push_back(app_from_json(item));
+    } catch (...) {}
+    return out;
+}
+
+// ── URL encode helper ─────────────────────────────────────────────────────────
+
+std::string url_encode(const std::string& s) {
+    // ASCII-only unreserved set, checked explicitly: std::isalnum is
+    // locale-dependent and on Windows (e.g. a CP1251 locale) can classify high
+    // UTF-8 bytes as "alphanumeric", leaving them unescaped and corrupting a
+    // Cyrillic term in the query. Also zero-pad each byte (%02X), so a byte
+    // below 0x10 is not emitted as a single hex digit.
+    static const char* hexd = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() * 3);
+    for (unsigned char c : s) {
+        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') || c == '-' || c == '_' || c == '.' || c == '~') {
+            out.push_back((char)c);
+        } else {
+            out.push_back('%');
+            out.push_back(hexd[c >> 4]);
+            out.push_back(hexd[c & 0x0F]);
+        }
+    }
+    return out;
+}
+
+std::string build_query(const std::map<std::string, std::string>& params) {
+    std::string q;
+    for (auto& [k, v] : params) {
+        if (!q.empty()) q += '&';
+        q += url_encode(k) + '=' + url_encode(v);
+    }
+    return q;
+}
+
+// ── Debug request/response dumps (--debug) ────────────────────────────────────
+
+// Credentials / account identifiers are masked (equal-length) so a --debug log
+// can be shared safely. Shared policy lives in ipt::mask_header_value.
+static std::string debug_mask_header(const std::string& name, const std::string& value) {
+    return ipt::mask_header_value(name, value);
+}
+
+// Write a UTF-8 string to stderr. On a real Windows console we go through
+// WriteConsoleW (UTF-16) so non-ASCII in --debug dumps (e.g. Cyrillic app names
+// and addresses in the list-purchases body) renders correctly instead of the
+// mojibake fprintf/fputs produce when the legacy console reads raw UTF-8 bytes
+// as its OEM code page. Redirected stderr (file/pipe) keeps raw UTF-8 bytes.
+static void debug_err(const std::string& s) {
+#ifdef _WIN32
+    if (_isatty(_fileno(stderr))) {
+        std::wstring w = ipt::utf8_to_wide(s);
+        HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+        if (h != INVALID_HANDLE_VALUE && !w.empty()) {
+            DWORD written = 0;
+            WriteConsoleW(h, w.data(), static_cast<DWORD>(w.size()), &written, nullptr);
+        }
+        return;
+    }
+#endif
+    fwrite(s.data(), 1, s.size(), stderr);
+}
+
+namespace {
+bool g_adiLog = false;                  // [ADI] trace, follows --debug
+void prov_log(const std::string& s);    // defined below
+}
+
+static void debug_dump_request(const char* label, const char* method,
+                               const std::string& url,
+                               const std::map<std::string, std::string>& headers,
+                               const std::string& body) {
+    std::ostringstream o;
+    o << "[DEBUG] -- " << label << " request --\n"
+      << "[DEBUG] " << method << " " << url << "\n"
+      << "[DEBUG] request headers:\n";
+    for (auto& [k, v] : headers)
+        o << "  " << k << ": " << debug_mask_header(k, v) << "\n";
+    o << "[DEBUG] request body (" << body.size() << " bytes):\n" << body << "\n";
+    debug_err(o.str());
+}
+
+static void debug_dump_response(const char* label, const HttpResponse& res,
+                                bool showBody = true) {
+    std::ostringstream o;
+    o << "[DEBUG] -- " << label << " response --\n"
+      << "[DEBUG] status: " << res.statusCode << "\n"
+      << "[DEBUG] response headers:\n";
+    for (auto& [k, v] : res.headers)
+        o << "  " << k << ": " << debug_mask_header(k, v) << "\n";
+    o << "[DEBUG] response body (" << res.body.size() << " bytes):\n"
+      << (!showBody ? "<not shown>"
+                    : (res.body.empty() ? "<empty>" : res.body)) << "\n";
+    debug_err(o.str());
+}
+
+// A songList item is usable as a download source only if it carries sinf data
+// ("sinf" for iOS, "dpInfo" for macOS). Apple sometimes returns the item
+// without it — such a response is treated like an empty songList.
+static bool has_sinfs(const PlistArray& songList) {
+    if (songList.empty() || !songList[0].isDict()) return false;
+    auto it = songList[0].dictVal.find("sinfs");
+    if (it == songList[0].dictVal.end() || !it->second.isArray()) return false;
+    for (const auto& s : it->second.arrayVal) {
+        if (!s.isDict()) continue;
+        for (const char* key : {"sinf", "dpInfo"}) {
+            auto f = s.dictVal.find(key);
+            if (f != s.dictVal.end() && f->second.isData() && !f->second.dataVal.empty())
+                return true;
+        }
+    }
+    return false;
+}
+
+// Build the base download filename "<name> <version>" (no extension), matching
+// iTunes, which names the file by the app's bundleDisplayName + a space + version
+// and does NOT put the numeric id in it. The display name is preferred; bundleID
+// is the fallback. Path-breaking characters in the name are replaced with '_'. The
+// id is used only as a last resort when nothing else yields a name. Ext by callers.
+static std::string build_base_filename(const std::string& displayName,
+                                       const App& app, const std::string& version) {
+    std::string front = !displayName.empty() ? displayName : app.bundleID;
+    // Replace characters that are invalid in a Windows filename (and path
+    // separators on any OS) with '_'; spaces are kept, as iTunes does.
+    for (char& c : front)
+        if (c == '/' || c == '\\' || c == ':' || c == '*' || c == '?' ||
+            c == '"' || c == '<'  || c == '>' || c == '|')
+            c = '_';
+    std::string name = front;
+    if (!version.empty()) { if (!name.empty()) name += " "; name += version; }
+    if (name.empty()) name = std::to_string(app.id);  // degenerate fallback only
+    return name;
+}
+
+// Redownload refusal meaning this account holds no license for the item.
+// Compared in full (Apple always sends these in English): other refusals with
+// different wording have other causes and must not trigger a purchase.
+static constexpr const char* REDOWNLOAD_UNAVAILABLE_MESSAGE =
+    "Redownload Unavailable with This Apple Account";
+static constexpr const char* REDOWNLOAD_UNAVAILABLE_EXPLANATION =
+    "This redownload is not available for this Apple Account either because it "
+    "was bought by a different user or the item was refunded or cancelled.";
+
+// Apple writes "Apple Account" with a no-break space (U+00A0), which looks like
+// a normal space in logs. Map Unicode spaces / tabs / newlines to ' ', collapse
+// runs and trim, so the full phrases still compare exactly.
+static std::string normalize_spaces(const std::string& in) {
+    std::string out;
+    bool pendingSpace = false;
+    for (size_t i = 0; i < in.size(); ) {
+        unsigned char c = (unsigned char)in[i];
+        size_t len = 0;
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n')                 len = 1;
+        else if (c == 0xC2 && i + 1 < in.size() && (unsigned char)in[i+1] == 0xA0) len = 2;  // U+00A0
+        else if (c == 0xE2 && i + 2 < in.size() && (unsigned char)in[i+1] == 0x80) {
+            unsigned char c2 = (unsigned char)in[i+2];
+            if ((c2 >= 0x80 && c2 <= 0x8A) || c2 == 0xAF) len = 3;       // U+2000..200A, U+202F
+        }
+        if (len) { pendingSpace = true; i += len; continue; }
+        if (pendingSpace && !out.empty()) out += ' ';
+        pendingSpace = false;
+        out += in[i++];
+    }
+    return out;
+}
+
+static bool is_redownload_unavailable(const PlistDict& d) {
+    auto match = [](const PlistDict& m) {
+        return normalize_spaces(dict_str(m, "message"))     == REDOWNLOAD_UNAVAILABLE_MESSAGE &&
+               normalize_spaces(dict_str(m, "explanation")) == REDOWNLOAD_UNAVAILABLE_EXPLANATION;
+    };
+    if (match(d)) return true;
+    auto it = d.find("dialog");   // Apple may nest them in a dialog dict
+    return it != d.end() && it->second.isDict() && match(it->second.dictVal);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Login
+// ─────────────────────────────────────────────────────────────────────────────
+
+Account AppStore::login(const std::string& email,
+              const std::string& password,
+              const std::string& endpoint)
+{
+    // Start every sign-in from a clean slate: a stale session cookie left over
+    // from a previous login (or an expired session) must not ride along into the
+    // new authenticate, or the server can answer on the old session instead of
+    // establishing a fresh one. Clearing first, then logging in, also means a
+    // re-login after a 401 truly replaces the cookies rather than merging.
+    m_http.clear_cookies();
+
+    std::string guid = get_guid();
+
+    // Fetch bag for both the auth endpoint and SAP config
+    BagOutput bag = fetch_bag(guid);
+    std::string loginEndpoint = endpoint.empty() ? bag.authEndpoint : endpoint;
+
+    prov_log("authenticate endpoint: " + loginEndpoint);
+
+    // Create SAP signer — performs handshake with Apple servers (v2.4.0+).
+    // Apple rejects unsigned authenticate requests and still counts them as
+    // failed sign-ins (repeated failures lock the Apple ID), so any SAP problem
+    // stops the login before a single request is sent — same as the Go version.
+    if (bag.signSapSetup.empty() || bag.signSapSetupCert.empty()
+        || bag.sapVersion != 200 || bag.hardwareID.empty())
+        throw IpaError("bag has no usable SAP signing configuration; "
+                       "refusing to send an unsigned login request");
+
+    std::unique_ptr<SapSigner> signer;
+    try {
+        SapSigner::Config sapCfg;
+        sapCfg.setupURL       = bag.signSapSetup;
+        sapCfg.certificateURL = bag.signSapSetupCert;
+        sapCfg.version        = bag.sapVersion;
+        sapCfg.hardwareID     = bag.hardwareID;
+
+        signer = SapSigner::Create(
+            sapCfg,
+            load_sap_asset("CoreFP"),
+            load_sap_asset("CommerceCore"),
+            load_sap_asset("CommerceKit"),
+            load_sap_asset("CoreFP.icxs")
+        );
+    } catch (const std::exception& e) {
+        throw IpaError(std::string("failed to initialize SAP signer: ") + e.what());
+    }
+    if (!signer)
+        throw IpaError("failed to initialize SAP signer");
+    if (m_debug) fprintf(stderr, "[DEBUG] SAP signer initialized OK\n");
+
+    return do_login(email, password, guid, loginEndpoint, *signer);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Search / Lookup
+// ─────────────────────────────────────────────────────────────────────────────
+
+AppStore::SearchOutput AppStore::search(const Account& acc, const std::string& term, int limit) {
+    std::string cc  = country_code_from_storefront(acc.storeFront);
+    std::string url = search_url(term, cc, limit);
+
+    if (m_debug) debug_dump_request("search", "GET", url, {}, "");
+    HttpResponse res = m_http.get(url);
+    if (m_debug) debug_dump_response("search", res);
+    if (res.statusCode != 200)
+        throw IpaError("search request failed: " + std::to_string(res.statusCode));
+
+    auto sr = parse_search_json(res.body);
+    return {sr.count, sr.results};
+}
+
+App AppStore::lookup(const Account& acc, const std::string& bundleID) {
+    std::string cc  = country_code_from_storefront(acc.storeFront);
+    std::string url = lookup_url(bundleID, cc);
+
+    if (m_debug) debug_dump_request("lookup", "GET", url, {}, "");
+    HttpResponse res = m_http.get(url);
+    if (m_debug) debug_dump_response("lookup", res);
+    if (res.statusCode != 200)
+        throw IpaError("lookup request failed: " + std::to_string(res.statusCode));
+
+    auto sr = parse_search_json(res.body);
+    if (sr.results.empty()) throw IpaError("app not found");
+    return sr.results[0];
+}
+
+App AppStore::lookup_by_id(const Account& acc, int64_t appID) {
+    std::string cc  = country_code_from_storefront(acc.storeFront);
+    std::map<std::string, std::string> p = {
+        {"entity",  "software,iPadSoftware"},
+        {"limit",   "1"},
+        {"media",   "software"},
+        {"id",      std::to_string(appID)},
+        {"country", cc},
+    };
+    std::string url = std::string("https://") + ITUNES_API_DOMAIN
+                    + ITUNES_API_PATH_LOOKUP + "?" + build_query(p);
+
+    if (m_debug) debug_dump_request("lookup-by-id", "GET", url, {}, "");
+    HttpResponse res = m_http.get(url);
+    if (m_debug) debug_dump_response("lookup-by-id", res);
+    if (res.statusCode != 200)
+        throw IpaError("lookup request failed: " + std::to_string(res.statusCode));
+
+    auto sr = parse_search_json(res.body);
+    if (sr.results.empty()) throw IpaError("app not found");
+    return sr.results[0];
+}
+
+AppStore::ListPurchasesOutput AppStore::list_purchases(const Account& acc, int page,
+                                                       const std::string& range) {
+    m_regeneratedPod.clear();
+
+    // Path + query are host-independent; only the host carries the pod prefix
+    // (p<pod>-buy.itunes.apple.com), same scheme as buyProduct.
+    std::string query = std::string(PRIVATE_AS_PATH_PURCHASES)
+                      + "?isDeepLink=false&isJsonApiFormat=true";
+    // page omitted when <= 0 — the endpoint then tends to return everything in
+    // one response; pass an explicit page only to fetch a specific later page.
+    if (page > 0)
+        query += "&page=" + std::to_string(page);
+    // range selects the time window: default (omitted) = last 90 days,
+    // "<year>-all" = that whole calendar year.
+    if (!range.empty())
+        query += "&range=" + url_encode(range);
+
+    // Mirror the iTunes Purchase History request: session cookies (carried by
+    // the shared jar) + X-Dsid + storefront + the Configurator UA. No anisette,
+    // no X-Token. No Accept-Encoding, so the JSON comes back uncompressed and we
+    // can read it directly.
+    std::map<std::string, std::string> headers = {
+        {"User-Agent",          CONFIGURATOR_UA},
+        {"Accept-Language",     "en-us"},
+        {"X-Apple-Store-Front", acc.storeFront},
+        {"X-Dsid",              acc.directoryServicesID},
+    };
+    // The captured trace didn't carry X-Token (cookies + DSID authorize here),
+    // but sending it too is harmless and covers the case where it's required.
+    if (!acc.passwordToken.get().empty())
+        headers["X-Token"] = acc.passwordToken.get();
+
+    auto build_url = [&](const std::string& pod) {
+        std::string prefix = pod.empty() ? "" : ("p" + pod + "-");
+        return "https://" + prefix + std::string(PRIVATE_AS_DOMAIN) + query;
+    };
+    // Extract the pod digits from a pod-prefixed URL (…//p<N>-buy.itunes…).
+    auto pod_from_url = [](const std::string& u) -> std::string {
+        auto p = u.find("://");
+        if (p == std::string::npos) return std::string();
+        p += 3;
+        if (p >= u.size() || u[p] != 'p') return std::string();
+        std::string digits;
+        size_t i = p + 1;
+        while (i < u.size() && u[i] >= '0' && u[i] <= '9') digits.push_back(u[i++]);
+        return (i < u.size() && u[i] == '-' && !digits.empty()) ? digits : std::string();
+    };
+    // Learn the pod Apple hands back: explicit 'pod' response header first, else
+    // parsed from a 302 Location host.
+    auto capture_pod = [&](const HttpResponse& r) {
+        auto it = r.headers.find(str_lower(HTTP_HEADER_POD));
+        if (it != r.headers.end() && !it->second.empty()) { m_regeneratedPod = it->second; return; }
+        if (r.statusCode == 302) {
+            auto loc = r.headers.find("location");
+            if (loc != r.headers.end()) {
+                std::string p = pod_from_url(loc->second);
+                if (!p.empty()) m_regeneratedPod = p;
+            }
+        }
+    };
+
+    std::string url = build_url(acc.pod);
+    HttpResponse res;
+    try {
+        if (m_debug) debug_dump_request("list-purchases", "GET", url, headers, "");
+        res = m_http.get(url, headers);
+        if (m_debug) debug_dump_response("list-purchases", res, /*showBody=*/false);
+    } catch (const DnsResolveError&) {
+        // The stored pod's hostname would not resolve. With no pod at all this is
+        // a genuine DNS failure — let it propagate. Otherwise the stored pod is
+        // likely stale: retry on the pod-less host; the 302 it returns is followed
+        // by the redirect loop below, which routes us to the correct pod.
+        if (acc.pod.empty()) throw;
+        std::string base = build_url("");    // https://buy.itunes.apple.com/…
+        if (m_debug) debug_dump_request("list-purchases(fallback)", "GET", base, headers, "");
+        res = m_http.get(base, headers);
+        if (m_debug) debug_dump_response("list-purchases(fallback)", res, /*showBody=*/false);
+    }
+
+    // Follow 302 redirects. FOLLOWLOCATION is off in the HTTP client, so we do it
+    // here. Apple uses two flavours, both handled by following the Location
+    // VERBATIM (it preserves our page/range query and carries Apple's own params):
+    //   • pod/cookie handshake — same host, adds &mzcprh=1 and Set-Cookie itspod=N,
+    //     then serves the data on retry (the cookie rides along via the shared
+    //     cookie jar, which captures Set-Cookie even on a 302);
+    //   • pod routing — Location points at the correct p<N>-buy host.
+    // We capture the pod from each hop (header or Location host) so the caller can
+    // persist it, and bound the loop so a misbehaving redirect can't spin forever.
+    // NOTE: do NOT rebuild the URL from the pod here — that drops Apple's extra
+    // query (e.g. mzcprh) and makes the handshake 302 loop endlessly.
+    for (int hop = 0; res.statusCode == 302 && hop < 4; ++hop) {
+        capture_pod(res);
+        auto loc = res.headers.find("location");
+        if (loc == res.headers.end() || loc->second.empty()) break;
+        if (m_debug) debug_dump_request("list-purchases(redir)", "GET", loc->second, headers, "");
+        res = m_http.get(loc->second, headers);
+        if (m_debug) debug_dump_response("list-purchases(redir)", res, /*showBody=*/false);
+    }
+
+    ListPurchasesOutput out;
+    out.statusCode = res.statusCode;
+    out.rawBody    = res.body;
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Purchase
+// ─────────────────────────────────────────────────────────────────────────────
+
+PlistDict AppStore::purchase(const Account& acc, const App& app) {
+    if (app.price > 0.0) throw PaidAppNotSupported();
+
+    std::string guid = get_guid();
+    try {
+        return do_purchase(acc, app, guid, PRICING_APPSTORE);
+    } catch (const IpaError& e) {
+        if (std::string(e.what()).find("temporarily unavailable") != std::string::npos) {
+            return do_purchase(acc, app, guid, PRICING_ARCADE);
+        } else {
+            throw;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Download
+// ─────────────────────────────────────────────────────────────────────────────
+
+AppStore::DownloadOutput AppStore::download(const Account& acc,
+                        const App& app,
+                        const std::string& outputPath,
+                        const std::string& externalVersionID,
+                        ProgressCb progress,
+                        const std::string& redownloadEndpoint,
+                        const std::string& volumeStoreDownloadEndpoint,
+                        const std::string& kbsyncB64,
+                        const std::string& songDownloadDoneEndpoint)
+{
+    std::string guid = get_guid();
+    m_regeneratedKbsync.clear();
+
+    // Stateless 3-endpoint cascade (volumeStoreDownloadProduct → redownloadProduct
+    // → updateProduct). Returns a served songList with sinf data, or throws
+    // (LicenseRequired lets a --purchase caller acquire the license).
+    PlistDict data = resolve_download(acc, app, guid, externalVersionID,
+                                      redownloadEndpoint, volumeStoreDownloadEndpoint,
+                                      kbsyncB64, /*isMac=*/false, /*needSinfs=*/true);
+    auto songList = dict_arr(data, "songList");
+
+    auto& itemVal = songList[0];
+    if (!itemVal.isDict()) throw IpaError("invalid response: bad songList item");
+
+    const PlistDict& item       = itemVal.dictVal;
+    std::string      downloadURL = dict_str(item, "URL");
+    std::string      md5Expected = dict_str(item, "md5");
+    // Per-chunk integrity manifest (optional): chunkSize + an array of md5s, one
+    // per chunk of the file as served. Lets us repair a single bad chunk by
+    // re-fetching just its range instead of the whole file. The manifest may be
+    // nested inside the item under a key we don't want to hard-code, so search
+    // the item tree for the dict that carries both keys. chunkSize / count come
+    // straight from the response, so any chunking is handled.
+    int64_t                  chunkSize = 0;
+    std::vector<std::string> chunkHashes;
+    find_chunk_manifest(item, chunkSize, chunkHashes);
+    // Per-chunk md5 verifier handed to the parallel downloader: it checks each
+    // chunk's bytes against the manifest as they arrive and makes the worker
+    // re-fetch a bad one. Also drives the single-stream repair pass below.
+    HttpClient::ChunkVerifier chunkVerify;
+    if (chunkSize > 0 && !chunkHashes.empty()) {
+        chunkVerify = [&chunkHashes](int idx, const uint8_t* data, size_t len) -> bool {
+            if (idx < 0 || (size_t)idx >= chunkHashes.size()) return false;
+            return ascii_iequals(md5_buf_hex(data, len), chunkHashes[idx]);
+        };
+    }
+    // Set true when download_parallel finishes and has already md5-verified every
+    // chunk inline, so verify_and_report skips the (now redundant) repair pass and
+    // only runs the authoritative whole-file md5 check.
+    bool parallelChunkVerified = false;
+    // download-id for the completion ping — comes from the same item as the URL
+    // (usually empty, but can be populated), passed through verbatim.
+    std::string      downloadId  = dict_str(item, "download-id");
+    // songId for the completion ping; it equals the adamId, so fall back to it.
+    int64_t          songId      = dict_int(item, "songId");
+    if (songId == 0) songId = app.id;
+    std::string      version     = "unknown";
+
+    auto metaIt  = item.find("metadata");
+    PlistDict metadata;
+    if (metaIt != item.end() && metaIt->second.isDict()) {
+        metadata = metaIt->second.dictVal;
+        auto vIt = metadata.find("bundleShortVersionString");
+        if (vIt != metadata.end() && vIt->second.isString())
+            version = vIt->second.str();
+    }
+    // iTunes names downloads by bundleDisplayName — always present in the response
+    // metadata (iOS and macOS), so numeric-id downloads (no catalog lookup) still
+    // get a name. build_base_filename falls back to bundleID if it were ever empty.
+    std::string displayName = dict_str(metadata, "bundleDisplayName");
+
+    std::vector<Sinf> sinfs;
+    auto sinfsIt = item.find("sinfs");
+    if (sinfsIt != item.end() && sinfsIt->second.isArray()) {
+        for (auto& sv : sinfsIt->second.arrayVal) {
+            if (!sv.isDict()) continue;
+            Sinf s;
+            s.id = dict_int(sv.dictVal, "id");
+            auto dit = sv.dictVal.find("sinf");
+            // dpInfo — macOS decryption key
+            auto dpit = sv.dictVal.find("dpInfo");
+            if (dpit != sv.dictVal.end() && dpit->second.isData())
+                s.dpInfo = dpit->second.dataVal;
+            if (dit != sv.dictVal.end() && dit->second.isData())
+                s.data = dit->second.dataVal;
+            sinfs.push_back(std::move(s));
+        }
+    }
+
+    // Verify the finished raw download against the store's md5, then report the
+    // completion to Apple. Called on the raw downloaded temp file (before any
+    // repack/decrypt), since the md5 describes the file exactly as served.
+    auto verify_and_report = [&](const std::string& rawTmpPath) {
+        // Per-chunk integrity. Three cases:
+        //  - parallel download already md5-verified every chunk inline → nothing to do;
+        //  - single-stream path + manifest present → verify each chunk now and
+        //    repair any corrupt one by re-fetching just its range;
+        //  - no manifest at all → dump item keys so we can see where it lives.
+        if (parallelChunkVerified) {
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] chunk manifest verified inline during parallel download "
+                                "(%zu chunks of %lld)\n",
+                        chunkHashes.size(), (long long)chunkSize);
+        } else if (chunkSize > 0 && !chunkHashes.empty()) {
+            if (verify_and_repair_chunks(m_http, downloadURL, rawTmpPath,
+                                         chunkSize, chunkHashes, m_debug)) {
+                if (m_debug)
+                    fprintf(stderr, "[DEBUG] chunk manifest verified (%zu chunks of %lld)\n",
+                            chunkHashes.size(), (long long)chunkSize);
+            } else if (m_debug) {
+                fprintf(stderr, "[DEBUG] chunk verify/repair did not complete "
+                                "- relying on whole-file md5 fallback\n");
+            }
+        } else if (m_debug) {
+            fprintf(stderr, "[DEBUG] no chunk manifest in response; item keys:");
+            for (auto& kv : item) fprintf(stderr, " %s", kv.first.c_str());
+            fprintf(stderr, "\n");
+        }
+
+        // Then verify the finished raw download against the store's whole-file md5
+        // (the authoritative overall check), and report completion to Apple.
+        if (!md5Expected.empty()) {
+            std::string actual = md5_file_hex(rawTmpPath);
+            if (actual.empty())
+                throw IpaError("could not compute md5 of downloaded file");
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] md5 check: expected=%s actual=%s\n",
+                        md5Expected.c_str(), actual.c_str());
+
+            if (!ascii_iequals(actual, md5Expected)) {
+                // download() only returns on a fully received transfer (curl
+                // CURLE_OK; short reads are retried), so a mismatch here means a
+                // complete-but-corrupt file — safe to discard. Re-download once
+                // from scratch (remove → rangeStart 0 → full GET) and re-check.
+                if (m_debug)
+                    fprintf(stderr, "[DEBUG] md5 mismatch - discarding and re-downloading once\n");
+                fs::remove(ipt::fs_path(rawTmpPath));
+                m_http.download(downloadURL, rawTmpPath, 0, progress);
+
+                actual = md5_file_hex(rawTmpPath);
+                if (m_debug)
+                    fprintf(stderr, "[DEBUG] md5 recheck: expected=%s actual=%s\n",
+                            md5Expected.c_str(), actual.c_str());
+                if (!ascii_iequals(actual, md5Expected)) {
+                    // Still bad — leave no corrupt .tmp behind so a manual re-run
+                    // starts clean instead of resuming onto garbage.
+                    fs::remove(ipt::fs_path(rawTmpPath));
+                    throw IpaError("download hash mismatch after re-download (expected md5 " +
+                                   md5Expected + ", got " + actual + ")");
+                }
+            }
+        } else if (m_debug) {
+            fprintf(stderr, "[DEBUG] no md5 in response - skipping hash verification\n");
+        }
+        // Completion ping is best-effort: a failure here must not invalidate the
+        // file we already downloaded and verified.
+        if (!songDownloadDoneEndpoint.empty()) {
+            try {
+                bool ok = report_download_done(acc, songId, downloadId, songDownloadDoneEndpoint);
+                if (m_debug)
+                    fprintf(stderr, "[DEBUG] songDownloadDone: %s\n",
+                            ok ? "success reported" : "no success marker in response");
+            } catch (const std::exception& e) {
+                if (m_debug) fprintf(stderr, "[DEBUG] songDownloadDone request failed: %s\n", e.what());
+            }
+        }
+    };
+
+    // ── macOS .pkg detection ───────────────────────────────────────────────────
+    // Detect by URL extension or metadata software-platform.
+    // pkg files must NOT go through minizip/apply_patches (they are XAR archives).
+    bool isMacPkg = (downloadURL.size() >= 4 &&
+                     downloadURL.substr(downloadURL.size()-4) == ".pkg");
+    if (!isMacPkg) {
+        auto platIt = metadata.find("software-platform");
+        if (platIt != metadata.end() && platIt->second.isString() &&
+            platIt->second.strVal == "macos")
+            isMacPkg = true;
+    }
+
+    if (isMacPkg) {
+        // Collect dpInfo from sinfs (may be empty for unencrypted apps)
+        std::vector<uint8_t> dpInfo;
+        for (auto& s : sinfs) {
+            if (!s.dpInfo.empty()) { dpInfo = s.dpInfo; break; }
+        }
+
+        // Resolve output path exactly like the iOS path: -o as a file is used
+        // verbatim, a directory gets "{name} {version}.pkg", empty defaults to the
+        // current directory. (Unicode-safe; no blind ".pkg" appending.)
+        std::string pkgDest = resolve_destination(app, version, outputPath, displayName, ".pkg");
+
+        std::string tmpPkg = pkgDest + ".tmp";
+        // Large files download over several connections; falls back to the
+        // single-connection resumable path when that isn't possible.
+        if (m_http.download_parallel(downloadURL, tmpPkg, progress,
+                                     chunkSize, (int)chunkHashes.size(), chunkVerify)) {
+            parallelChunkVerified = (bool)chunkVerify;   // chunks already verified inline
+        } else {
+            int64_t rangeStart = file_size(tmpPkg);
+            m_http.download(downloadURL, tmpPkg, rangeStart, progress);
+        }
+
+        verify_and_report(tmpPkg);
+
+        if (dpInfo.empty()) {
+            // Unencrypted (drmVersionNumber=0) — rename directly
+            if (m_debug) fprintf(stderr, "[DEBUG] macOS pkg is unencrypted, saving directly\n");
+            std::error_code ec;
+            fs::rename(ipt::fs_path(tmpPkg), ipt::fs_path(pkgDest), ec);
+            if (ec) {
+                fs::copy_file(ipt::fs_path(tmpPkg), ipt::fs_path(pkgDest),
+                              fs::copy_options::overwrite_existing, ec);
+                fs::remove(ipt::fs_path(tmpPkg), ec);
+                if (ec) throw IpaError("failed to save pkg: " + ec.message());
+            }
+        } else {
+            // Encrypted — StoreAgent decrypt
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] macOS pkg encrypted, dpInfo=%zu bytes\n", dpInfo.size());
+            auto hardwareID = SapSigner::LocalHardwareID();
+            auto machine = StoreAgentMachine::Create(
+                load_sap_asset("CoreFP"),
+                load_sap_asset("CommerceCore"),
+                load_sap_asset("CommerceKit"),
+                load_sap_asset("CoreFP.icxs"),
+                load_sap_asset("storeagent")
+            );
+            uint32_t gctx    = machine->InitializeGlobal(hardwareID);
+            uint64_t session = machine->InitializeSession(gctx, dpInfo);
+
+            std::string decTmp = pkgDest + ".dec";
+            {
+                std::ifstream src_f(ipt::fs_path(tmpPkg), std::ios::binary);
+                std::ofstream dst_f(ipt::fs_path(decTmp), std::ios::binary | std::ios::trunc);
+                if (!src_f) throw IpaError("cannot open encrypted pkg");
+                if (!dst_f) throw IpaError("cannot open decrypted pkg output");
+                std::vector<uint8_t> buf(StoreAgentMachine::kChunkSize);
+                while (true) {
+                    src_f.read(reinterpret_cast<char*>(buf.data()), buf.size());
+                    std::streamsize n = src_f.gcount();
+                    if (n == 0) break;
+                    std::span<uint8_t> chunk(buf.data(), static_cast<size_t>(n));
+                    machine->DecryptChunk(session, chunk);
+                    dst_f.write(reinterpret_cast<const char*>(chunk.data()), n);
+                }
+            }
+            machine->CloseSession(session);
+            fs::remove(ipt::fs_path(tmpPkg));
+            std::error_code ec;
+            fs::rename(ipt::fs_path(decTmp), ipt::fs_path(pkgDest), ec);
+            if (ec) { fs::copy_file(ipt::fs_path(decTmp), ipt::fs_path(pkgDest), fs::copy_options::overwrite_existing); fs::remove(ipt::fs_path(decTmp)); }
+        }
+        return { pkgDest, sinfs };
+    }
+
+    // ── iOS IPA path ────────────────────────────────────────────────────────
+    std::string dest    = resolve_destination(app, version, outputPath, displayName);
+    std::string tmpDest = dest + ".tmp";
+
+    // Large files download over several connections; falls back to the
+    // single-connection resumable path when that isn't possible.
+    if (m_http.download_parallel(downloadURL, tmpDest, progress,
+                                 chunkSize, (int)chunkHashes.size(), chunkVerify)) {
+        parallelChunkVerified = (bool)chunkVerify;   // chunks already verified inline
+    } else {
+        int64_t rangeStart = file_size(tmpDest);
+        m_http.download(downloadURL, tmpDest, rangeStart, progress);
+    }
+
+    verify_and_report(tmpDest);
+
+    apply_patches(item, acc, tmpDest, dest, sinfs);
+    fs::remove(ipt::fs_path(tmpDest));
+
+    return {dest, sinfs};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — List Versions / Get Version Metadata
+// ─────────────────────────────────────────────────────────────────────────────
+
+AppStore::ListVersionsOutput AppStore::list_versions(const Account& acc,
+                        const App& app,
+                        const std::string& redownloadEndpoint,
+                        const std::string& volumeStoreDownloadEndpoint,
+                        const std::string& kbsyncB64)
+{
+    std::string guid = get_guid();
+    m_regeneratedKbsync.clear();
+
+    // Stateless 3-endpoint cascade; list-versions needs only item metadata, so
+    // sinf data is not required (needSinfs=false).
+    PlistDict data = resolve_download(acc, app, guid, /*externalVersionID=*/"",
+                                      redownloadEndpoint, volumeStoreDownloadEndpoint,
+                                      kbsyncB64, /*isMac=*/false, /*needSinfs=*/false);
+    auto songList = dict_arr(data, "songList");
+    {
+    auto& itemVal = songList[0];
+    if (!itemVal.isDict()) throw IpaError("invalid response: bad songList item");
+    const PlistDict& item = itemVal.dictVal;
+
+    auto metaIt = item.find("metadata");
+    if (metaIt == item.end() || !metaIt->second.isDict())
+        throw IpaError("failed to get version identifiers from item metadata");
+    const PlistDict& metadata = metaIt->second.dictVal;
+
+    // softwareVersionExternalIdentifiers — array of version IDs
+    ListVersionsOutput out;
+    auto idsIt = metadata.find("softwareVersionExternalIdentifiers");
+    if (idsIt == metadata.end() || !idsIt->second.isArray())
+        throw IpaError("failed to get version identifiers from item metadata");
+    for (auto& v : idsIt->second.arrayVal)
+        out.externalVersionIdentifiers.push_back(v.isInt()
+            ? std::to_string(v.intVal) : v.str());
+
+    // softwareVersionExternalIdentifier — latest version
+    auto latIt = metadata.find("softwareVersionExternalIdentifier");
+    if (latIt == metadata.end())
+        throw IpaError("failed to get latest version from item metadata");
+    out.latestExternalVersionID = latIt->second.isInt()
+        ? std::to_string(latIt->second.intVal) : latIt->second.str();
+
+    return out;
+    } // version-identifier extraction block
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Minimum-OS extraction
+//
+// The App Store metadata does not carry the app's minimum iOS version — Xcode
+// bakes it into the bundle's Info.plist (MinimumOSVersion) at build time. To
+// read it without downloading the whole (often multi-GB) IPA, we treat the
+// signed download URL as a remote ZIP and pull out just Payload/<App>.app/
+// Info.plist via HTTP range requests + the ZIP central directory. The IPA's
+// container is a plain ZIP and Info.plist is NOT FairPlay-encrypted (only the
+// Mach-O __TEXT is), so it decompresses directly. Everything here is
+// best-effort: any failure just leaves the field empty.
+// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+
+inline uint16_t rd_u16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
+inline uint32_t rd_u32(const uint8_t* p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+inline uint64_t rd_u64(const uint8_t* p) {
+    return (uint64_t)rd_u32(p) | ((uint64_t)rd_u32(p + 4) << 32);
+}
+
+// Raw DEFLATE (ZIP method 8) → `out` (expected uncompressed size `outSize`).
+bool zip_inflate_raw(const uint8_t* in, size_t inLen, size_t outSize, std::string& out) {
+    out.assign(outSize, '\0');
+    z_stream zs{};
+    if (inflateInit2(&zs, -15) != Z_OK) return false;   // -15 = raw deflate, no zlib header
+    zs.next_in   = const_cast<Bytef*>(in);
+    zs.avail_in  = static_cast<uInt>(inLen);
+    zs.next_out  = reinterpret_cast<Bytef*>(outSize ? &out[0] : nullptr);
+    zs.avail_out = static_cast<uInt>(outSize);
+    int rc = inflate(&zs, Z_FINISH);
+    size_t produced = zs.total_out;
+    inflateEnd(&zs);
+    if (rc != Z_STREAM_END) return false;
+    out.resize(produced);
+    return true;
+}
+
+// Total size of the resource behind `url` via a 0-0 range probe
+// (Content-Range: bytes 0-0/TOTAL). -1 if the server doesn't honour the range.
+int64_t http_total_size(const HttpClient& http, const std::string& url) {
+    try {
+        HttpResponse r = http.get_range(url, "0-0", 64 * 1024);
+        if (r.statusCode != 206) return -1;   // 200 ⇒ range ignored — don't trust/stream
+        auto it = r.headers.find("content-range");
+        if (it == r.headers.end()) return -1;
+        auto slash = it->second.rfind('/');
+        if (slash == std::string::npos) return -1;
+        std::string tot = it->second.substr(slash + 1);
+        if (tot.empty() || tot == "*") return -1;
+        return std::stoll(tot);
+    } catch (const std::exception&) { return -1; }
+}
+
+// Fetch byte range [start, start+len-1]; caps the sink a little above `len`.
+std::vector<uint8_t> http_range(const HttpClient& http, const std::string& url,
+                                int64_t start, int64_t len) {
+    std::string spec = std::to_string(start) + "-" + std::to_string(start + len - 1);
+    HttpResponse r = http.get_range(url, spec, static_cast<size_t>(len) + 1024);
+    return std::vector<uint8_t>(r.body.begin(), r.body.end());
+}
+
+// DOS date/time (local, no timezone, 2-second resolution) -> naive ISO-8601.
+static std::string dos_to_iso(uint16_t date, uint16_t time) {
+    int yr = ((date >> 9) & 0x7f) + 1980;
+    int mo = (date >> 5) & 0x0f;
+    int dy =  date       & 0x1f;
+    int hh = (time >> 11) & 0x1f;
+    int mi = (time >> 5)  & 0x3f;
+    int ss = (time        & 0x1f) * 2;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d", yr, mo, dy, hh, mi, ss);
+    return buf;
+}
+
+// Unix seconds (UTC) -> ISO-8601 with a trailing Z. "" on a bad value.
+static std::string unix_to_iso_utc(int64_t secs) {
+    time_t t = (time_t)secs;
+    struct tm g{};
+#ifdef _WIN32
+    if (gmtime_s(&g, &t) != 0) return "";
+#else
+    if (!gmtime_r(&t, &g)) return "";
+#endif
+    char buf[48];   // room for an out-of-range year without truncation
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             g.tm_year + 1900, g.tm_mon + 1, g.tm_mday, g.tm_hour, g.tm_min, g.tm_sec);
+    return buf;
+}
+
+// Pull Payload/<App>.app/Info.plist out of the remote .ipa. false on any issue.
+// When outModified is non-null, it also receives that entry's ZIP modification
+// time as ISO-8601 (empty if unavailable) — used as the version's release date.
+bool fetch_ipa_info_plist(const HttpClient& http, const std::string& url,
+                          std::string& outPlist, std::string* outModified = nullptr) {
+    int64_t size = http_total_size(http, url);
+    if (size <= 0) return false;
+
+    // 1. Locate the End-Of-Central-Directory record in the file tail.
+    const int64_t tailWant = 65557;    // 22-byte EOCD + up to 65535-byte comment
+    int64_t tailLen  = std::min<int64_t>(size, tailWant);
+    int64_t tailBase = size - tailLen;
+    std::vector<uint8_t> tail = http_range(http, url, tailBase, tailLen);
+    if ((int64_t)tail.size() != tailLen) return false;
+
+    int64_t eocd = -1;
+    for (int64_t i = (int64_t)tail.size() - 22; i >= 0; --i) {
+        if (tail[i]==0x50 && tail[i+1]==0x4b && tail[i+2]==0x05 && tail[i+3]==0x06) {
+            eocd = i; break;
+        }
+    }
+    if (eocd < 0) return false;
+
+    uint32_t cdSize32 = rd_u32(&tail[eocd + 12]);
+    uint32_t cdOff32  = rd_u32(&tail[eocd + 16]);
+    int64_t  cdOffset = cdOff32;
+    int64_t  cdSize   = cdSize32;
+
+    // 2. ZIP64 when the 32-bit fields are maxed out (large apps).
+    if (cdOff32 == 0xFFFFFFFFu || cdSize32 == 0xFFFFFFFFu) {
+        int64_t loc = eocd - 20;   // ZIP64 EOCD locator "PK\x06\x07" precedes EOCD
+        if (loc < 0 || !(tail[loc]==0x50 && tail[loc+1]==0x4b &&
+                         tail[loc+2]==0x06 && tail[loc+3]==0x07))
+            return false;
+        uint64_t z64off = rd_u64(&tail[loc + 8]);
+        std::vector<uint8_t> z = http_range(http, url, (int64_t)z64off, 56);
+        if (z.size() < 56 || !(z[0]==0x50 && z[1]==0x4b && z[2]==0x06 && z[3]==0x06))
+            return false;
+        cdSize   = (int64_t)rd_u64(&z[40]);
+        cdOffset = (int64_t)rd_u64(&z[48]);
+    }
+    if (cdOffset < 0 || cdSize <= 0 || cdOffset + cdSize > size) return false;
+
+    // 3. Scan the central directory for the MAIN app's Info.plist.
+    std::vector<uint8_t> cd = http_range(http, url, cdOffset, cdSize);
+    if ((int64_t)cd.size() != cdSize) return false;
+
+    static const std::regex mainInfo(R"(^Payload/[^/]+\.app/Info\.plist$)");
+    int64_t  localOff = -1, compSize = -1, uncompSize = -1;
+    uint16_t method = 0;
+
+    size_t p = 0;
+    while (p + 46 <= cd.size()) {
+        if (!(cd[p]==0x50 && cd[p+1]==0x4b && cd[p+2]==0x01 && cd[p+3]==0x02)) break;
+        uint16_t m  = rd_u16(&cd[p + 10]);
+        uint32_t cs = rd_u32(&cd[p + 20]);
+        uint32_t us = rd_u32(&cd[p + 24]);
+        uint16_t nl = rd_u16(&cd[p + 28]);
+        uint16_t el = rd_u16(&cd[p + 30]);
+        uint16_t cl = rd_u16(&cd[p + 32]);
+        uint32_t lo = rd_u32(&cd[p + 42]);
+        if (p + 46 + nl > cd.size()) break;
+        std::string name(reinterpret_cast<const char*>(&cd[p + 46]), nl);
+
+        if (std::regex_match(name, mainInfo)) {
+            if (outModified) {
+                // The version's build/packaging date: prefer the extended-
+                // timestamp extra field (0x5455, Unix UTC) and fall back to the
+                // DOS date/time (local, 2-second resolution). iOS Info.plist
+                // carries no release-date key, so this entry's mtime is the only
+                // in-package per-version date — the catalog date is now uniform
+                // across versions and can't be trusted.
+                uint16_t dosTime = rd_u16(&cd[p + 12]);
+                uint16_t dosDate = rd_u16(&cd[p + 14]);
+                std::string mt;
+                size_t ep = p + 46 + nl, eend = ep + el, q = ep;
+                while (q + 4 <= eend && q + 4 <= cd.size()) {
+                    uint16_t id  = rd_u16(&cd[q]);
+                    uint16_t len = rd_u16(&cd[q + 2]);
+                    size_t   dp  = q + 4;
+                    // 0x5455: flags byte, then mtime (LE Unix) when bit0 is set.
+                    if (id == 0x5455 && len >= 5 && dp + 5 <= cd.size() && (cd[dp] & 0x01)) {
+                        mt = unix_to_iso_utc((int64_t)rd_u32(&cd[dp + 1]));
+                        break;
+                    }
+                    q += 4 + len;
+                }
+                if (mt.empty() && dosDate != 0) mt = dos_to_iso(dosDate, dosTime);
+                *outModified = mt;
+            }
+            int64_t cs64 = cs, us64 = us, lo64 = lo;
+            // ZIP64 extra (id 0x0001) supplies 64-bit values for whichever
+            // 32-bit fields read 0xFFFFFFFF, in order: uncomp, comp, localoff.
+            if (cs == 0xFFFFFFFFu || us == 0xFFFFFFFFu || lo == 0xFFFFFFFFu) {
+                size_t ep = p + 46 + nl, eend = ep + el, q = ep;
+                while (q + 4 <= eend && q + 4 <= cd.size()) {
+                    uint16_t id  = rd_u16(&cd[q]);
+                    uint16_t len = rd_u16(&cd[q + 2]);
+                    size_t   dp  = q + 4;
+                    if (id == 0x0001) {
+                        if (us == 0xFFFFFFFFu && dp + 8 <= eend) { us64 = (int64_t)rd_u64(&cd[dp]); dp += 8; }
+                        if (cs == 0xFFFFFFFFu && dp + 8 <= eend) { cs64 = (int64_t)rd_u64(&cd[dp]); dp += 8; }
+                        if (lo == 0xFFFFFFFFu && dp + 8 <= eend) { lo64 = (int64_t)rd_u64(&cd[dp]); dp += 8; }
+                        break;
+                    }
+                    q += 4 + len;
+                }
+            }
+            method = m; compSize = cs64; uncompSize = us64; localOff = lo64;
+            break;
+        }
+        p += 46 + nl + el + cl;
+    }
+    if (localOff < 0 || compSize < 0 || (method != 0 && method != 8)) return false;
+    if (localOff + 30 > size) return false;
+
+    // 4. Read the local file header for the true data offset, then the bytes.
+    std::vector<uint8_t> lh = http_range(http, url, localOff, 30);
+    if (lh.size() < 30 || !(lh[0]==0x50 && lh[1]==0x4b && lh[2]==0x03 && lh[3]==0x04))
+        return false;
+    uint16_t lnl = rd_u16(&lh[26]);
+    uint16_t lel = rd_u16(&lh[28]);
+    int64_t  dataStart = localOff + 30 + lnl + lel;
+    if (dataStart + compSize > size) return false;
+    std::vector<uint8_t> data = http_range(http, url, dataStart, compSize);
+    if ((int64_t)data.size() != compSize) return false;
+
+    // 5. Stored (0) or raw-deflate (8).
+    if (method == 0) {
+        outPlist.assign(reinterpret_cast<const char*>(data.data()), data.size());
+        return true;
+    }
+    return zip_inflate_raw(data.data(), data.size(), (size_t)uncompSize, outPlist);
+}
+
+// Read MinimumOSVersion out of an Info.plist blob (binary or XML). "" if absent.
+std::string min_os_from_info_plist(const std::string& plistBytes) {
+    try {
+        PlistDict info = decode_plist(plistBytes);
+        std::string v = dict_str(info, "MinimumOSVersion");
+        if (v.empty()) v = dict_str(info, "minimumOSVersion");   // tolerate casing
+        return v;
+    } catch (const std::exception&) { return ""; }
+}
+
+// Read CFBundleSupportedPlatforms out of an Info.plist blob (e.g. ["iPhoneOS"]).
+// Empty if the key is absent or the plist can't be parsed.
+std::vector<std::string> platforms_from_info_plist(const std::string& plistBytes) {
+    std::vector<std::string> result;
+    try {
+        PlistDict info = decode_plist(plistBytes);
+        for (const auto& v : dict_arr(info, "CFBundleSupportedPlatforms"))
+            if (v.isString() && !v.str().empty()) result.push_back(v.str());
+    } catch (const std::exception&) { /* best-effort — leave empty */ }
+    return result;
+}
+
+// ── macOS: minimum OS from the preflight package (.pfpkg) ────────────────────
+// A macOS app has no iOS-style Info.plist; the store instead exposes a tiny
+// "preflightPackageURL". That resource is a XAR archive (magic "xar!") whose
+// member "Distribution" (a compiler-/installer-gui XML) carries
+//   <allowed-os-versions><os-version min="15.7"/></allowed-os-versions>
+// Both the XAR table-of-contents and the Distribution member are zlib/gzip
+// compressed, so the value is NOT present as plaintext in the raw bytes. The
+// file is small (tens of KB), so rather than parse the XAR TOC we download it
+// whole and scan for compressed streams, inflate each, and read the os-version
+// min out of whichever one is the Distribution XML. Best-effort throughout.
+
+// Inflate a zlib- or gzip-wrapped stream at `in` (auto-detect header), growing
+// the output. true if a complete stream decoded.
+bool inflate_grow(const uint8_t* in, size_t inLen, std::string& out) {
+    out.clear();
+    z_stream zs{};
+    if (inflateInit2(&zs, 15 + 32) != Z_OK) return false;   // 32 = auto zlib/gzip
+    zs.next_in  = const_cast<Bytef*>(in);
+    zs.avail_in = static_cast<uInt>(inLen);
+    char buf[16384];
+    int rc;
+    do {
+        zs.next_out  = reinterpret_cast<Bytef*>(buf);
+        zs.avail_out = sizeof(buf);
+        rc = inflate(&zs, Z_NO_FLUSH);
+        if (rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR) break;
+        out.append(buf, sizeof(buf) - zs.avail_out);
+        if (rc == Z_BUF_ERROR) break;   // stalled (no progress) → give up
+        if (out.size() > 8u * 1024 * 1024) break;   // sanity cap on a preflight XML
+    } while (rc != Z_STREAM_END);
+    inflateEnd(&zs);
+    return rc == Z_STREAM_END;
+}
+
+// Valid zlib header start? (CM=deflate, CINFO<=7, FCHECK passes)
+bool looks_zlib(const uint8_t* p, size_t n) {
+    if (n < 2) return false;
+    if ((p[0] & 0x0f) != 8)  return false;
+    if ((p[0] & 0xf0) > 0x70) return false;
+    return (((unsigned)p[0] << 8) | p[1]) % 31 == 0;
+}
+bool looks_gzip(const uint8_t* p, size_t n) {
+    return n >= 3 && p[0] == 0x1f && p[1] == 0x8b && p[2] == 0x08;
+}
+
+// Scan a (small) preflight package for compressed streams; return the
+// os-version min= from whichever inflates to the Distribution XML. "" if none.
+std::string min_os_from_pfpkg(const std::string& fileBytes) {
+    const uint8_t* d = reinterpret_cast<const uint8_t*>(fileBytes.data());
+    size_t n = fileBytes.size();
+    // Custom raw-string delimiter: the pattern itself contains )" .
+    static const std::regex re(R"RX(os-version[^>]*\bmin="([^"]+)")RX");
+    for (size_t i = 0; i + 2 < n; ++i) {
+        if (!looks_zlib(d + i, n - i) && !looks_gzip(d + i, n - i)) continue;
+        std::string out;
+        if (!inflate_grow(d + i, n - i, out)) continue;
+        if (out.find("os-version") == std::string::npos) continue;
+        std::smatch m;
+        if (std::regex_search(out, m, re)) return m[1].str();
+    }
+    return "";
+}
+
+// macOS preflight: the build time of the selected version, encoded in a legacy
+// installer version string "<major.minor.patch>.0.1.<10-digit Unix time>" on a
+// <pkg-ref> in the Distribution XML, validated against the <product> version.
+// Returns ISO-8601 UTC, or "" if the package carries no such timestamp (then the
+// caller keeps the catalog date). Mirrors the Go reader's legacy build-time rule.
+std::string release_date_from_pfpkg(const std::string& fileBytes) {
+    auto split_dots = [](const std::string& s) {
+        std::vector<std::string> out; size_t start = 0;
+        for (size_t i = 0; i <= s.size(); ++i)
+            if (i == s.size() || s[i] == '.') { out.push_back(s.substr(start, i - start)); start = i + 1; }
+        return out;
+    };
+    auto all_digits = [](const std::string& s) {
+        if (s.empty()) return false;
+        for (char c : s) if (!std::isdigit((unsigned char)c)) return false;
+        return true;
+    };
+
+    const uint8_t* d = reinterpret_cast<const uint8_t*>(fileBytes.data());
+    size_t n = fileBytes.size();
+    static const std::regex prodRe(R"RX(<product\b[^>]*\bversion="([^"]*)")RX");
+    static const std::regex pkgRe(R"RX(<pkg-ref\b[^>]*\bversion="([^"]*)")RX");
+
+    for (size_t i = 0; i + 2 < n; ++i) {
+        if (!looks_zlib(d + i, n - i) && !looks_gzip(d + i, n - i)) continue;
+        std::string xml;
+        if (!inflate_grow(d + i, n - i, xml)) continue;
+        if (xml.find("pkg-ref") == std::string::npos) continue;
+
+        std::smatch pm;
+        if (!std::regex_search(xml, pm, prodRe)) continue;
+        std::vector<std::string> dv = split_dots(pm[1].str());
+        while (dv.size() < 3) dv.push_back("0");
+        if (dv.size() != 3) continue;
+        std::string base = dv[0] + "." + dv[1] + "." + dv[2];
+
+        // Scan every pkg-ref version for the legacy build-time shape. Multiple
+        // refs can describe one package; if two give different times, the result
+        // is ambiguous — leave it to the catalog rather than guess.
+        long long secs = 0;
+        bool conflict = false;
+        for (std::sregex_iterator it(xml.begin(), xml.end(), pkgRe), end; it != end; ++it) {
+            std::vector<std::string> p = split_dots((*it)[1].str());
+            if (p.size() != 6) continue;
+            if (p[0] + "." + p[1] + "." + p[2] != base) continue;
+            if (p[3] != "0" || p[4] != "1" || p[5].size() != 10) continue;
+            bool ok = true;
+            for (const auto& part : p) if (!all_digits(part)) { ok = false; break; }
+            if (!ok) continue;
+            long long t = 0;
+            try { t = std::stoll(p[5]); } catch (...) { continue; }
+            if (t <= 0) continue;
+            if (secs != 0 && secs != t) { conflict = true; break; }
+            secs = t;
+        }
+        if (!conflict && secs > 0) return unix_to_iso_utc(secs);
+    }
+    return "";
+}
+
+// Inflate a XAR's table-of-contents from in-memory bytes. The TOC is a zlib
+// stream right after the 28-byte header (big-endian fields). "" on anything that
+// isn't a readable XAR. The preflight package is a small, unencrypted XAR, so its
+// TOC is reachable this way (the main .pkg is encrypted and is not read here).
+std::string xar_toc_xml(const std::string& fileBytes) {
+    if (fileBytes.size() < 28) return "";
+    const uint8_t* f = reinterpret_cast<const uint8_t*>(fileBytes.data());
+    if (!(f[0]==0x78 && f[1]==0x61 && f[2]==0x72 && f[3]==0x21)) return "";   // "xar!"
+    uint32_t headerSize = (uint32_t)((f[4] << 8) | f[5]);
+    uint64_t tocComp = 0; for (int i = 0; i < 8; i++) tocComp = (tocComp << 8) | f[8 + i];
+    if (headerSize < 28 || tocComp == 0 || tocComp > 16u * 1024 * 1024
+        || (uint64_t)headerSize + tocComp > fileBytes.size())
+        return "";
+    std::string xml;
+    if (!inflate_grow(f + headerSize, (size_t)tocComp, xml)) return "";
+    return xml;
+}
+
+// The XAR's own <creation-time> (UTC) — when Apple built this package for the
+// version. In a preflight the per-file mtimes are zeroed, so this is the only
+// in-package build date, and it is historical (not the download time). ISO-8601
+// with a trailing Z, or "" if absent.
+std::string xar_creation_time(const std::string& toc) {
+    static const std::regex re(R"RX(<creation-time>([^<]+)</creation-time>)RX");
+    std::smatch m;
+    if (!std::regex_search(toc, m, re)) return "";
+    std::string t = m[1].str();
+    if (!t.empty() && t.back() != 'Z' && t.find('+') == std::string::npos) t += "Z";
+    return t;
+}
+
+} // namespace
+
+AppStore::GetVersionMetadataOutput AppStore::get_version_metadata(const Account& acc,
+                                               const App& app,
+                                               const std::string& versionID,
+                                               const std::string& redownloadEndpoint,
+                                               const std::string& volumeStoreDownloadEndpoint,
+                                               const std::string& kbsyncB64)
+{
+    std::string guid = get_guid();
+    m_regeneratedKbsync.clear();
+
+    // Stateless 3-endpoint cascade; get-version-metadata needs only item metadata.
+    PlistDict data = resolve_download(acc, app, guid, versionID,
+                                      redownloadEndpoint, volumeStoreDownloadEndpoint,
+                                      kbsyncB64, /*isMac=*/false, /*needSinfs=*/false);
+    auto songList = dict_arr(data, "songList");
+    auto& itemVal = songList[0];
+    if (!itemVal.isDict()) throw IpaError("invalid response: bad songList item");
+    const PlistDict& item = itemVal.dictVal;
+
+    auto metaIt = item.find("metadata");
+    if (metaIt == item.end() || !metaIt->second.isDict())
+        throw IpaError("failed to get metadata from item");
+    const PlistDict& metadata = metaIt->second.dictVal;
+
+    GetVersionMetadataOutput out;
+    auto dvIt = metadata.find("bundleShortVersionString");
+    if (dvIt != metadata.end()) out.displayVersion = dvIt->second.str();
+    auto rdIt = metadata.find("releaseDate");
+    if (rdIt != metadata.end()) out.releaseDate = rdIt->second.str();
+
+    // Minimum iOS version isn't in the store metadata — read it from the IPA's
+    // Info.plist via HTTP range requests (no full download). Best-effort: on any
+    // failure the field stays empty and the command still returns version+date.
+    // Guarded to genuine .ipa assets only: the signed download URL carries the
+    // extension on the path before the query string, e.g.
+    //   https://iosapps.itunes.apple.com/.../Foo.signed.dpkg.ipa?accessKey=…
+    // (note the literal "dpkg" inside the name — we match the real ".ipa" suffix,
+    // not a substring). Anything else — a macOS .pkg (xar, not a ZIP) or any
+    // other asset — is left untouched.
+    std::string ipaURL  = dict_str(item, "URL");
+    std::string ipaPath = ipaURL.substr(0, ipaURL.find('?'));   // strip ?accessKey=…
+    auto ends_with_ci = [](const std::string& s, const char* suf) {
+        size_t n = std::strlen(suf);
+        if (s.size() < n) return false;
+        for (size_t i = 0; i < n; ++i)
+            if (std::tolower((unsigned char)s[s.size() - n + i]) != (unsigned char)suf[i])
+                return false;
+        return true;
+    };
+    if (ends_with_ci(ipaPath, ".ipa")) {
+        // iOS: Payload/<App>.app/Info.plist → MinimumOSVersion (range-ZIP), and
+        // the version's real release date. Apple's catalog releaseDate has gone
+        // stale (same value for every version), so prefer the Info.plist entry's
+        // ZIP mtime (this version's build/packaging time). Info.plist carries no
+        // release-date key — and a developer could add a custom key by that name,
+        // so we never read a date out of the plist body. Keep the catalog date
+        // only when the IPA yields no mtime.
+        try {
+            std::string infoPlist, infoModified;
+            if (fetch_ipa_info_plist(m_http, ipaURL, infoPlist, &infoModified)) {
+                out.minimumOSVersion   = min_os_from_info_plist(infoPlist);
+                out.supportedPlatforms = platforms_from_info_plist(infoPlist);
+
+                if (!infoModified.empty()) {
+                    if (m_debug && !out.releaseDate.empty() && out.releaseDate != infoModified)
+                        fprintf(stderr, "[DEBUG] releaseDate: catalog %s -> IPA %s\n",
+                                out.releaseDate.c_str(), infoModified.c_str());
+                    out.releaseDate = infoModified;
+                }
+            }
+        } catch (const std::exception&) { /* best-effort — keep the catalog date */ }
+    } else {
+        // macOS: no .ipa, and the main .pkg is fully encrypted (needs the dpInfo
+        // key to decrypt the whole file before its XAR is readable), so we don't
+        // touch it. The preflight package, however, is a small unencrypted XAR —
+        // we already fetch it for the minimum OS version. Its real per-version
+        // date is the XAR's own <creation-time> (the per-file mtimes are zeroed);
+        // some older packages instead encode a build time in a legacy installer
+        // version string. Catalog date only as a last resort.
+        out.supportedPlatforms = {"macOS"};
+
+        std::string pfURL = dict_str(metadata, "preflightPackageURL");
+        if (pfURL.empty()) pfURL = dict_str(item, "preflightPackageURL");
+        if (!pfURL.empty()) {
+            try {
+                // whole file, following redirects; cap guards a surprise large asset
+                HttpResponse pf = m_http.get_range(pfURL, "0-", 64u * 1024 * 1024);
+                if (!pf.body.empty()) {
+                    out.minimumOSVersion = min_os_from_pfpkg(pf.body);
+
+                    // XAR creation-time first, then the legacy version-string time.
+                    std::string pfDate = xar_creation_time(xar_toc_xml(pf.body));
+                    if (pfDate.empty()) pfDate = release_date_from_pfpkg(pf.body);
+                    if (!pfDate.empty()) {
+                        if (m_debug && !out.releaseDate.empty() && out.releaseDate != pfDate)
+                            fprintf(stderr, "[DEBUG] releaseDate: catalog %s -> preflight %s\n",
+                                    out.releaseDate.c_str(), pfDate.c_str());
+                        out.releaseDate = pfDate;
+                    }
+                }
+            } catch (const std::exception&) { /* best-effort — keep the catalog date */ }
+        }
+    }
+
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Private: misc / kbsync
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GUID sent with every App Store request: hex of the physical adapter's MAC
+// (device_mac.cpp). Throws IpaError when no real address is available, so no
+// request ever goes out with a placeholder device ID.
+std::string AppStore::get_guid() {
+    return device_guid();
+}
+
+void AppStore::set_debug(bool v) {
+    m_debug = v;
+    g_adiLog = v;
+    m_http.set_debug(v);
+    SapSigner::SetDebug(v);
+    device_mac_set_debug(v);
+}
+
+std::vector<uint8_t> AppStore::generate_kbsync(uint64_t dsid) {
+    // Same hardware identity as the GUID sent with every request.
+    auto hardwareID = device_mac_address();
+
+    // FairPlay's global-context init is heavy (~20 s on a fast host, longer on
+    // a slow Unicorn build). Warn so a --debug run doesn't look frozen.
+    if (m_debug)
+        fprintf(stderr, "[DEBUG] kbsync: generating via FairPlay emulation, "
+                        "this can take up to a minute...\n");
+
+    auto machine = StoreAgentMachine::Create(
+        load_sap_asset("CoreFP"),
+        load_sap_asset("CommerceCore"),
+        load_sap_asset("CommerceKit"),
+        load_sap_asset("CoreFP.icxs"),
+        load_sap_asset("storeagent"));
+
+    uint32_t ctx = machine->InitializeGlobal(hardwareID);
+    if (m_debug)
+        fprintf(stderr, "[DEBUG] kbsync: FairPlay global context %u\n", ctx);
+
+    auto kbsync = machine->KBSyncData(ctx, dsid);
+    if (m_debug)
+        fprintf(stderr, "[DEBUG] kbsync: %zu bytes for DSID %llu\n",
+                kbsync.size(), static_cast<unsigned long long>(dsid));
+    return kbsync;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Store AMD (ADI provisioning)
+// ─────────────────────────────────────────────────────────────────────────────
+
+namespace {
+
+// DSIDs used by the anonymous (no account) provisioning path — same values the
+// upstream Go port uses: ADI is provisioned for ~0, kbsync is made for ~1.
+constexpr uint64_t kAnonAdiDSID    = ~uint64_t(0);
+
+// User-Agent for the native Store flow: bag (ix=6), authenticate, provisioning
+// finish and the AMD-carrying commerce requests.
+constexpr const char* PROV_AUTH_UA =
+    "Configurator/2.21 (Macintosh; OS X 15.7; 24G222) AppleWebKit/0620.2.4.11.6";
+// md-/amd-finish-provisioning and md-/amd-sync-machine come from the native bag
+// (no hard-coded fallbacks): Apple moves these around, and a stale default just
+// fails confusingly, so prov_finish_url()/prov_sync_url() throw if the bag omits them.
+
+void prov_log(const std::string& s) {
+    if (g_adiLog) debug_err("[ADI] " + s + "\n");
+}
+
+std::string dsid_str(uint64_t dsid) {
+    if (dsid == kAnonAdiDSID) return "-1 (anonymous)";
+    return std::to_string(dsid);
+}
+
+// "https://host/path?query" → "host/path" (keeps the log readable)
+std::string short_url(const std::string& url) {
+    std::string s = url;
+    auto p = s.find("://");
+    if (p != std::string::npos) s = s.substr(p + 3);
+    auto q = s.find('?');
+    if (q != std::string::npos) s = s.substr(0, q);
+    return s;
+}
+
+bool is_md_header(const std::string& k) {   // k is lower-case
+    return k.rfind("x-apple-md", 0) == 0 || k.rfind("x-apple-amd", 0) == 0 ||
+           k.rfind("x-apple-i-md", 0) == 0;
+}
+
+std::string clip(const std::string& v, size_t n = 96) {
+    return v.size() <= n ? v : v.substr(0, n) + "...(" + std::to_string(v.size()) + " chars)";
+}
+
+PlistDict decode_plist_quiet(const std::string& body) {
+    try { return decode_plist(body); } catch (...) { return {}; }
+}
+
+// plist value → bytes: <data> as-is, <string> base64-decoded.
+std::vector<uint8_t> plist_bytes(const PlistDict& d, const std::string& key) {
+    auto it = d.find(key);
+    if (it == d.end()) return {};
+    if (it->second.isData())   return it->second.dataVal;
+    if (it->second.isString()) {
+        try { return SapBase64::Decode(it->second.str()); } catch (...) {}
+    }
+    return {};
+}
+
+} // namespace
+
+void AppStore::init_store_adi(const std::string& cookieFile) {
+    if (!cookieFile.empty()) {
+        auto slash = cookieFile.find_last_of("/\\");
+        std::string dir = slash == std::string::npos ? "." : cookieFile.substr(0, slash);
+        m_adiStatePath = dir + "/adi-state";
+        std::error_code ec;
+        m_adiStateExisted = std::filesystem::exists(ipt::fs_path(m_adiStatePath), ec);
+    }
+
+    // With --debug: report store/auth responses and any MD-family header.
+    m_http.set_observer([this](const std::string& method, const std::string& url,
+                               const HttpResponse& res) {
+        if (!m_debug) return;
+        std::string line = method + " " + short_url(url) + " -> " +
+                           std::to_string(res.statusCode);
+        bool any = false;
+        for (const auto& [k, v] : res.headers) {
+            if (!is_md_header(k)) continue;
+            line += "\n        " + k + ": " + clip(v);
+            any = true;
+        }
+        if (!any) {
+            // Action headers only ever come from the store/auth hosts.
+            std::string host = short_url(url);
+            host = host.substr(0, host.find('/'));
+            bool storeHost = host.find("buy.itunes.apple.com") != std::string::npos ||
+                             host == "auth.itunes.apple.com" ||
+                             host == "downloaddispatch.itunes.apple.com";
+            if (!storeHost) return;
+            line += "   (response: no md/amd action)";
+        }
+        prov_log(line);
+    });
+}
+
+StoreAgentMachine& AppStore::adi_machine() {
+    if (m_adi) return *m_adi;
+
+    auto t0 = std::chrono::steady_clock::now();
+    prov_log("starting storeagent + CoreADI emulator (FairPlay init is deferred until needed)...");
+    m_adi = StoreAgentMachine::Create(
+        load_sap_asset("CoreFP"),
+        load_sap_asset("CommerceCore"),
+        load_sap_asset("CommerceKit"),
+        load_sap_asset("CoreFP.icxs"),
+        load_sap_asset("storeagent"),
+        load_sap_asset("CoreADI"));
+
+    // Saved state first: FairPlay's global init reads the SC Info keybag.
+    if (!m_adiStatePath.empty()) {
+        std::ifstream in(ipt::fs_path(m_adiStatePath), std::ios::binary);
+        if (in) {
+            std::vector<uint8_t> st((std::istreambuf_iterator<char>(in)),
+                                     std::istreambuf_iterator<char>());
+            try {
+                m_adi->ImportAdiState(st);
+                prov_log("loaded ADI state (" + std::to_string(st.size()) + " bytes)");
+            } catch (const std::exception& e) {
+                prov_log(std::string("ignoring unreadable ADI state: ") + e.what());
+            }
+        } else {
+            prov_log("no saved ADI state - starting unprovisioned");
+        }
+    }
+
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+    prov_log("emulator ready in " + std::to_string(ms) + " ms (FairPlay init deferred)");
+
+    // Escape hatch / A-B test: the old behaviour (FairPlay init at creation).
+    if (const char* e = std::getenv("IPATOOL_ADI_EAGER_FP"); e && *e && *e != '0')
+        adi_fp_ctx();
+    return *m_adi;
+}
+
+uint32_t AppStore::adi_fp_ctx() {
+    auto& m = adi_machine();
+    if (m_adiCtx) return m_adiCtx;
+
+    // The ADI state (SC Info keybag) was imported in adi_machine(), i.e. before
+    // this point — FairPlay's global init reads that keybag.
+    auto t0 = std::chrono::steady_clock::now();
+    prov_log("FairPlay global init (needed for kbsync / keybag import; can take ~20 s)...");
+    m_adiCtx = m.InitializeGlobal(device_mac_address());
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::steady_clock::now() - t0).count();
+    prov_log("FairPlay ready in " + std::to_string(ms) + " ms, FairPlay ctx " +
+             std::to_string(m_adiCtx));
+    return m_adiCtx;
+}
+
+void AppStore::adi_save() {
+    if (!m_adi || m_adiStatePath.empty()) return;
+    auto st = m_adi->ExportAdiState();
+    std::ofstream out(ipt::fs_path(m_adiStatePath), std::ios::binary | std::ios::trunc);
+    if (!out) { prov_log("WARNING: cannot write ADI state to " + m_adiStatePath); return; }
+    out.write(reinterpret_cast<const char*>(st.data()), static_cast<std::streamsize>(st.size()));
+}
+
+std::string AppStore::prov_finish_url(uint64_t /*dsid*/) const {
+    // The endpoint follows the header family the server used (md → otp/1.0,
+    // amd → otp/1.5 in the Mac App Store bag); either one accepts an account
+    // DSID or the anonymous -1, so the DSID does not pick the endpoint. No
+    // fallback — the bag is the source of truth (Apple moves these around).
+    if (m_mdFamily == "X-Apple-AMD") {
+        if (m_bagAmdFinish.empty()) throw IpaError("bag has no amd-finish-provisioning URL");
+        return m_bagAmdFinish;
+    }
+    if (m_bagMdFinish.empty()) throw IpaError("bag has no md-finish-provisioning URL");
+    return m_bagMdFinish;
+}
+
+std::string AppStore::prov_sync_url() const {
+    if (m_mdFamily == "X-Apple-AMD") {
+        if (m_bagAmdSync.empty()) throw IpaError("bag has no amd-sync-machine URL");
+        return m_bagAmdSync;
+    }
+    if (m_bagMdSync.empty()) throw IpaError("bag has no md-sync-machine URL");
+    return m_bagMdSync;
+}
+
+void AppStore::prov_add_md(std::map<std::string, std::string>& hdrs, uint64_t dsid,
+                           const char* label) {
+    // Lazy start: with no saved state and no provisioning done in this run
+    // nothing can be provisioned, so don't pay for the FairPlay init yet.
+    if (!m_adi && !m_adiStateExisted) {
+        prov_log(std::string(label) + ": DSID " + dsid_str(dsid) +
+                 " not provisioned (no ADI state yet) -> no MD headers");
+        return;
+    }
+    try {
+        auto& m = adi_machine();
+        int32_t st = 0;
+        auto otp = m.AdiRequestOTP(dsid, &st);
+        if (!otp) {
+            prov_log(std::string(label) + ": DSID " + dsid_str(dsid) +
+                     " not provisioned (OTP status " + std::to_string(st) + ") -> no MD headers");
+            return;
+        }
+        hdrs[m_mdFamily]        = SapBase64::Encode(otp->otp);
+        hdrs[m_mdFamily + "-M"] = SapBase64::Encode(otp->machineID);
+        // storeagent appends the last machine-sync result to every MD set.
+        const auto sync = m.GetSyncState();
+        if (!sync.empty()) hdrs[m_mdFamily + "-S"] = SapBase64::Encode(sync);
+        prov_log(std::string(label) + ": DSID " + dsid_str(dsid) + " provisioned -> sending " +
+                 m_mdFamily + " (" + std::to_string(otp->otp.size()) + " B) + " +
+                 m_mdFamily + "-M (" + std::to_string(otp->machineID.size()) + " B)" +
+                 (sync.empty() ? "" : " + " + m_mdFamily + "-S (" +
+                                      std::to_string(sync.size()) + " B)"));
+        adi_save();   // the OTP counter lives in adi.pb
+    } catch (const std::exception& e) {
+        prov_log(std::string(label) + ": OTP failed: " + e.what());
+    }
+}
+
+bool AppStore::prov_handle(const char* label, const HttpResponse& res, uint64_t dsid,
+                           const std::string& guid, const std::string& token) {
+
+    std::string action, data, family;
+    for (const char* fam : { "x-apple-md", "x-apple-amd" }) {
+        auto a = res.headers.find(std::string(fam) + "-action");
+        if (a == res.headers.end()) continue;
+        action = a->second;
+        auto d = res.headers.find(std::string(fam) + "-data");
+        if (d != res.headers.end()) data = d->second;
+        family = std::string(fam) == "x-apple-md" ? "X-Apple-MD" : "X-Apple-AMD";
+        break;
+    }
+    if (action.empty()) return false;
+
+    if (family != m_mdFamily) {
+        prov_log("server uses the " + family + " header family - switching");
+        m_mdFamily = family;
+    }
+    prov_log(std::string(label) + ": server action '" + action + "' for DSID " + dsid_str(dsid) +
+             (data.empty() ? "" : ", data " + std::to_string(data.size()) + " chars"));
+
+    try {
+        auto& m = adi_machine();
+
+        if (action == "RP") {   // Restart Provisioning
+            int32_t st = m.AdiErase(dsid);
+            m.SetSyncState({});   // belongs to the provisioning just dropped
+            adi_save();
+            prov_log("RP: erased provisioning (status " + std::to_string(st) + "), resending without MD");
+            return true;
+        }
+
+        if (action == "SM") {   // Sync Machine (-[ADIMachineSyncOperation run])
+            if (data.empty()) { prov_log("SM without md-data - cannot sync"); return false; }
+            auto sim = SapBase64::Decode(data);
+            auto sync = m.AdiSynchronize(dsid, sim);
+            adi_save();   // the sync updates adi.pb
+            prov_log("SM: ADI sync OK - clientData " + std::to_string(sync.clientData.size()) +
+                     " B, machineId " + std::to_string(sync.machineId.size()) + " B");
+
+            // Body exactly as storeagent builds it: {clientData, machineId, dsId}.
+            PlistDict p;
+            p["clientData"] = PlistValue::makeString(SapBase64::Encode(sync.clientData));
+            p["machineId"]  = PlistValue::makeString(SapBase64::Encode(sync.machineId));
+            p["dsId"]       = PlistValue::makeInt(static_cast<int64_t>(dsid));
+            std::string body = encode_plist_xml(p);
+            std::map<std::string, std::string> hdrs = {
+                {"Content-Type", "application/x-apple-plist"},
+                {"User-Agent",   PROV_AUTH_UA},
+            };
+            if (dsid != kAnonAdiDSID) {
+                hdrs["X-Dsid"]      = std::to_string(dsid);
+                hdrs["iCloud-DSID"] = std::to_string(dsid);
+                if (!token.empty()) hdrs["X-Token"] = token;
+            }
+
+            std::string url = prov_sync_url();
+            prov_log("SM: POST " + url);
+            if (m_debug) debug_dump_request("syncMachine", "POST", url, hdrs, body);
+            HttpResponse sr = m_http.post(url, body, hdrs);
+            if (m_debug) debug_dump_response("syncMachine", sr);
+
+            PlistDict r = decode_plist_quiet(sr.body);
+            const bool refused = !dict_str(r, "failureType").empty() ||
+                                 (!dict_str(r, "customerMessage").empty() &&
+                                  dict_str(r, "customerMessage").rfind("AMD-Action:", 0) != 0);
+            if (refused) {
+                prov_log("SM: server refused: failureType=" + dict_str(r, "failureType") +
+                         " customerMessage=" + dict_str(r, "customerMessage"));
+                return false;
+            }
+            // The sync endpoint may itself answer RP: the machine is beyond
+            // syncing. Drop the provisioning and resend — that leads to SP.
+            if (auto a = sr.headers.find("x-apple-amd-action"); a != sr.headers.end()
+                    || (a = sr.headers.find("x-apple-md-action")) != sr.headers.end()) {
+                if (a->second == "RP") {
+                    int32_t est = m.AdiErase(dsid);
+                    m.SetSyncState({});
+                    adi_save();
+                    prov_log("SM: sync answered RP - erased provisioning (status " +
+                             std::to_string(est) + "), resending without MD");
+                    return true;
+                }
+            }
+            auto syncState = plist_bytes(r, "syncState");
+            if (!syncState.empty()) {
+                m.SetSyncState(syncState);
+                adi_save();
+                prov_log("SM: syncState " + std::to_string(syncState.size()) +
+                         " B - sent as " + m_mdFamily + "-S from now on");
+            } else {
+                prov_log("SM: HTTP " + std::to_string(sr.statusCode) + ", no syncState in reply");
+            }
+            prov_log("SM: machine sync done - resending");
+            return true;
+        }
+
+        if (action != "SP") {
+            prov_log("unknown action '" + action + "' - ignored");
+            return false;
+        }
+
+        // ── SP: Start Provisioning ─────────────────────────────────────────
+        if (data.empty()) { prov_log("SP without md-data - cannot provision"); return false; }
+        auto spim = SapBase64::Decode(data);
+        prov_log("SP: server data " + std::to_string(spim.size()) + " bytes");
+
+        // Provisioning is the one flow that needs FairPlay (kbsync + keybag
+        // import). Initialise it here — before AdiStartProvisioning — so the
+        // call order stays exactly what it was when the init ran at creation.
+        adi_fp_ctx();
+
+        auto start = m.AdiStartProvisioning(dsid, spim);
+        prov_log("SP: ADI start OK - clientData " + std::to_string(start.clientData.size()) +
+                 " bytes, session " + std::to_string(start.session));
+
+        // Anonymous finish (DSID -1): {clientData, guid}. Only an account
+        // DSID gets the 10.9 storeagent extras (kbsync, dsId).
+        PlistDict p;
+        p["clientData"] = PlistValue::makeString(SapBase64::Encode(start.clientData));
+        p["guid"]       = PlistValue::makeString(guid);
+        if (dsid != kAnonAdiDSID) {
+            auto kb = m.KBSyncData(adi_fp_ctx(), dsid);
+            prov_log("SP: kbsync " + std::to_string(kb.size()) + " bytes for DSID " + std::to_string(dsid));
+            p["kbsync"] = PlistValue::makeString(SapBase64::Encode(kb));
+            p["dsId"]   = PlistValue::makeInt(static_cast<int64_t>(dsid));
+        }
+        std::string body = encode_plist_xml(p);
+
+        std::map<std::string, std::string> hdrs = {
+            {"Content-Type", "application/x-apple-plist"},
+            {"User-Agent",   PROV_AUTH_UA},
+        };
+        if (dsid != kAnonAdiDSID) {
+            hdrs["X-Dsid"]      = std::to_string(dsid);
+            hdrs["iCloud-DSID"] = std::to_string(dsid);
+        }
+        if (!token.empty() && dsid != kAnonAdiDSID) hdrs["X-Token"] = token;
+
+        std::string url = prov_finish_url(dsid);
+        prov_log("SP: POST " + url);
+        if (m_debug) debug_dump_request("finishProvisioning", "POST", url, hdrs, body);
+        HttpResponse fr = m_http.post(url, body, hdrs);
+        if (m_debug) debug_dump_response("finishProvisioning", fr);
+
+        PlistDict r = decode_plist_quiet(fr.body);
+        {
+            std::string keys;
+            for (const auto& [k, v] : r) keys += (keys.empty() ? "" : ", ") + k;
+            prov_log("SP: finish -> HTTP " + std::to_string(fr.statusCode) +
+                     ", keys: [" + keys + "]");
+        }
+        if (!dict_str(r, "failureType").empty() || !dict_str(r, "customerMessage").empty()) {
+            prov_log("SP: server refused: failureType=" + dict_str(r, "failureType") +
+                     " customerMessage=" + dict_str(r, "customerMessage"));
+            return false;
+        }
+
+        auto si = plist_bytes(r, "settingInfo");
+        auto tk = plist_bytes(r, "transportKey");
+        if (si.empty() || tk.empty()) {
+            prov_log("SP: response has no settingInfo/transportKey" +
+                     std::string(fr.body.empty() ? "" : " - body: " + clip(fr.body, 300)));
+            return false;
+        }
+        prov_log("SP: settingInfo " + std::to_string(si.size()) + " B, transportKey " +
+                 std::to_string(tk.size()) + " B");
+
+        m.AdiEndProvisioning(start.session, si, tk);
+        m.SetSyncState({});   // a fresh provisioning starts unsynced
+        prov_log("SP: ADI end OK - DSID " + dsid_str(dsid) + " is provisioned");
+
+        auto keyBag = plist_bytes(r, "keybag");
+        if (!keyBag.empty()) {
+            int32_t kst = m.ImportKeyBag(adi_fp_ctx(), keyBag);
+            prov_log("SP: FairPlay keybag " + std::to_string(keyBag.size()) +
+                     " B imported, status " + std::to_string(kst));
+        }
+        adi_save();
+
+        int32_t st = 0;
+        auto otp = m.AdiRequestOTP(dsid, &st);
+        prov_log(otp ? "SP: OTP check OK (" + std::to_string(otp->otp.size()) + " B) - resending with MD"
+                     : "SP: OTP check still fails (status " + std::to_string(st) + ")");
+        return otp.has_value();
+    } catch (const std::exception& e) {
+        prov_log(std::string(label) + ": action '" + action + "' failed: " + e.what());
+        return false;
+    }
+}
+
+namespace {
+// Depth-first lookup of a string key anywhere in the bag (urlBag, root, nested).
+std::string bag_find(const PlistDict& d, const std::string& key) {
+    std::string v = dict_str(d, key);
+    if (!v.empty()) return v;
+    for (const auto& [k, val] : d)
+        if (val.isDict()) {
+            v = bag_find(val.dictVal, key);
+            if (!v.empty()) return v;
+        }
+    return {};
+}
+} // namespace
+
+HttpResponse AppStore::prov_post(const char* label, const std::string& url,
+                                 const std::string& body,
+                                 const std::map<std::string, std::string>& headers,
+                                 uint64_t dsid, const std::string& guid,
+                                 const std::string& token,
+                                 const std::string& storeFront) {
+    HttpResponse res;
+    for (int round = 0; round < 3; ++round) {
+        auto h = headers;
+        h["User-Agent"] = PROV_AUTH_UA;
+        if (!token.empty())      h["X-Token"]             = token;
+        if (!storeFront.empty()) h["X-Apple-Store-Front"] = storeFront;
+        prov_add_md(h, dsid, label);
+        if (m_debug) debug_dump_request(label, "POST", url, h, body);
+        res = m_http.post(url, body, h);
+        if (m_debug) debug_dump_response(label, res);
+        if (!prov_handle(label, res, dsid, guid, token)) break;
+        prov_log(std::string(label) + ": resending (round " + std::to_string(round + 2) + ")");
+    }
+    // HTTP 401 Unauthorized on a commerce endpoint means the session itself has
+    // expired (cookies / password token), not a provisioning or kbsync problem —
+    // a 401 carries no x-apple-(a)md-action, so prov_handle above did nothing with
+    // it. Signal a silent re-login: the command layer catches PasswordTokenExpired,
+    // runs silent_relogin (which rewrites the cookie file and refreshes the token),
+    // and retries once with the fresh session. This mirrors the recovery already
+    // done for a plist PASSWORD_TOKEN_EXPIRED failure, and for the 401 the
+    // list-purchases path already handles. 403 is left alone: on the download
+    // cascade it is often a legitimate region/entitlement refusal, not a stale
+    // session, and must stay on its normal path.
+    if (res.statusCode == 401) {
+        prov_log(std::string(label) + ": HTTP 401 Unauthorized - session expired,"
+                 " requesting silent re-login");
+        throw PasswordTokenExpired();
+    }
+    return res;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Private: download endpoints, cascade & bag
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Device serial (fserial) for volumeStoreDownloadProduct ──────────────────
+// Device serial for volumeStoreDownload: 9 bytes (54 C8 B0 A9 88 + last 4 bytes of the
+// GUID), base64-encoded. Unique per machine. guid is 12 hex chars (6 bytes).
+static std::string make_fserial(const std::string& guid) {
+    std::vector<uint8_t> bytes = { 0x54, 0xC8, 0xB0, 0xA9, 0x88 };
+    std::string tail = guid.size() >= 8 ? guid.substr(guid.size() - 8) : guid;
+    for (size_t i = 0; i + 1 < tail.size(); i += 2) {
+        try { bytes.push_back((uint8_t)std::stoul(tail.substr(i, 2), nullptr, 16)); }
+        catch (...) { break; }
+    }
+    return SapBase64::Encode(bytes);
+}
+
+// ── volumeStoreDownloadProduct (bag download endpoint, kbsync-signed) ───────
+PlistDict AppStore::volume_store_download_product(const Account& acc, const App& app,
+                                      const std::string& guid,
+                                      const std::string& volumeStoreDownloadEndpoint,
+                                      const std::string& kbsyncB64,
+                                      const std::string& externalVersionID,
+                                      bool authed,
+                                      int& httpStatus)
+{
+    httpStatus = 0;
+    std::string url = volumeStoreDownloadEndpoint + "?guid=" + guid;
+
+    // Headers match the reference tool exactly (note: form-urlencoded content
+    // type even though the body is a plist, plus an explicit Configurator UA).
+    std::map<std::string, std::string> hdrs = {
+        {"Content-Type",        "application/x-www-form-urlencoded; charset=utf-8"},
+        {"User-Agent",          "Configurator/2.18 (Macintosh; OS X 15.3.2; 24D81) "
+                                "AppleWebKit/0620.2.4.11.6"},
+        {"iCloud-DSID",         acc.directoryServicesID},
+        {"X-Dsid",              acc.directoryServicesID},
+        {"X-Apple-Store-Front", acc.storeFront},
+        {"X-Token",             acc.passwordToken.get()},
+    };
+
+    PlistDict p;
+    p["creditDisplay"] = PlistValue::makeString("");
+    p["guid"]          = PlistValue::makeString(guid);
+    p["kbsync"]        = PlistValue::makeString(kbsyncB64);
+    p["salableAdamId"] = PlistValue::makeString(std::to_string(app.id));
+    // Fall back to computing the serial from the GUID for accounts saved before
+    // fserial existed (it is deterministic, so this equals the login-time value).
+    p["serialNumber"]  = PlistValue::makeString(
+        acc.fserial.empty() ? make_fserial(guid) : acc.fserial);
+    if (!externalVersionID.empty())
+        p["externalVersionId"] = PlistValue::makeString(externalVersionID);
+    // 2042 AuthTokenResumeFreeBuy confirmation ("Download" in the dialog).
+    if (authed)
+        p["hasBeenAuthedForBuy"] = PlistValue::makeString("true");
+
+    std::string body = encode_plist_xml(p);
+    HttpResponse res = prov_post("volumeStoreDownload", url, body, hdrs,
+                    kAnonAdiDSID, guid, acc.passwordToken.get(), acc.storeFront);
+    httpStatus = res.statusCode;
+    return decode_plist(res.body);
+}
+
+// Report a completed download to Apple via the bag's songDownloadDone URL.
+// The host gets the account pod prefix (p<pod>-…) and the query carries songId
+// (= adamId), an empty download-id, the pod, and the request guid. GET only —
+// just cookies + headers, no body. Success = jingleDocType "success".
+bool AppStore::report_download_done(const Account& acc, int64_t songId,
+                                    const std::string& downloadId,
+                                    const std::string& songDownloadDoneEndpoint)
+{
+    if (songDownloadDoneEndpoint.empty()) return false;
+    std::string guid = get_guid();
+
+    // Inject the pod prefix right after the scheme:
+    //   https://buy.itunes.apple.com/… → https://p<pod>-buy.itunes.apple.com/…
+    // The bag may already be pod-personalised (Apple reads the itspod cookie
+    // set at sign-in), so leave a host that already starts with p<digits>-.
+    std::string url = songDownloadDoneEndpoint;
+    if (!acc.pod.empty()) {
+        auto pos = url.find("://");
+        if (pos != std::string::npos) {
+            size_t h = pos + 3, i = h + 1;
+            while (i < url.size() && std::isdigit((unsigned char)url[i])) ++i;
+            bool hasPod = i < url.size() && url[h] == 'p' && i > h + 1 && url[i] == '-';
+            if (!hasPod) url.insert(h, "p" + acc.pod + "-");
+        }
+    }
+    url += "?songId="       + std::to_string(songId)
+         + "&download-id="  + downloadId
+         + "&Pod="          + acc.pod
+         + "&guid="         + guid;
+
+    // Same shape as volume_store_download_product, minus X-Token; GET carries no body.
+    // Accept-Encoding is intentionally omitted — curl does not auto-decompress
+    // a manually requested gzip, and the plist response is tiny anyway.
+    std::map<std::string, std::string> hdrs = {
+        {"User-Agent",          "Configurator/2.18 (Macintosh; OS X 15.3.2; 24D81) "
+                                "AppleWebKit/0620.2.4.11.6"},
+        {"Accept",              "*/*"},
+        {"Accept-Language",     "en-US"},
+        {"iCloud-DSID",         acc.directoryServicesID},
+        {"X-Dsid",              acc.directoryServicesID},
+        {"X-Apple-Store-Front", acc.storeFront},
+    };
+
+    if (m_debug) debug_dump_request("songDownloadDone", "GET", url, hdrs, "");
+    HttpResponse res = m_http.get(url, hdrs);
+    if (m_debug) debug_dump_response("songDownloadDone", res);
+
+    if (res.statusCode != 200) return false;
+    // jingleDocType success — tolerant to plist whitespace/formatting.
+    return res.body.find("<string>success</string>") != std::string::npos;
+}
+
+
+// ── Redownload / updateProduct (port of upstream appstore_download_product.go)
+
+static std::string trim_copy(const std::string& v) {
+    size_t b = v.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    size_t e = v.find_last_not_of(" \t\r\n");
+    return v.substr(b, e - b + 1);
+}
+
+static std::string plist_scalar_str(const PlistDict& d, const std::string& key) {
+    auto it = d.find(key);
+    if (it == d.end()) return "";
+    return it->second.isInt() ? std::to_string(it->second.intVal) : it->second.str();
+}
+
+// Upstream isUnavailableDownloadProductResponse: 200, no failureType, no items,
+// customerMessage "No Longer Available" (optionally prefixed).
+static bool is_unavailable_response(int statusCode, const PlistDict& d) {
+    if (statusCode != 200 || !dict_str(d, "failureType").empty()
+        || !dict_arr(d, "songList").empty())
+        return false;
+    std::string m = trim_copy(dict_str(d, "customerMessage"));
+    std::transform(m.begin(), m.end(), m.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    static const std::string kSuffix = " no longer available";
+    return m == "no longer available"
+        || (m.size() > kSuffix.size()
+            && m.compare(m.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0);
+}
+
+// Decode a response body; an empty or non-plist body yields an empty dict.
+static PlistDict decode_plist_safe(const std::string& body) {
+    if (trim_copy(body).empty()) return {};
+    try { return decode_plist(body); } catch (...) { return {}; }
+}
+
+// Headers and payload shared by the downloadProduct-family requests
+// (redownloadProduct, updateProduct).
+static std::map<std::string, std::string> download_request_headers(const Account& acc) {
+    return {
+        {"Content-Type", "application/x-apple-plist"},
+        {"iCloud-DSID",  acc.directoryServicesID},
+        {"X-Dsid",       acc.directoryServicesID},
+    };
+}
+
+static std::string download_request_payload(const std::string& guid, const App& app,
+                                            const std::string& appExtVrsId) {
+    PlistDict p;
+    p["creditDisplay"] = PlistValue::makeString("");
+    p["guid"]          = PlistValue::makeString(guid);
+    p["salableAdamId"] = PlistValue::makeInt(app.id);
+    p["serialNumber"]  = PlistValue::makeString("0");
+    if (!appExtVrsId.empty())
+        p["appExtVrsId"] = PlistValue::makeString(appExtVrsId);
+    return encode_plist_xml(p);
+}
+
+// ── resolve_download — stateless 3-endpoint cascade ─────────────────────────
+// We keep no local library state, so we cannot know up front which endpoint owns
+// the app. We try all three bag endpoints in order and take the first that serves:
+//   1) volumeStoreDownloadProduct (kbsync)  — the modern primary path
+//   2) redownloadProduct                    — re-acquire from purchase history
+//   3) updateProduct                        — library / update dispatch
+// "served" means a songList item is present — with sinf data when the caller must
+// decrypt (download), or just metadata when it need not (list-versions,
+// get-version-metadata). If none serves and the account simply has no license, we
+// throw LicenseRequired so a --purchase caller can acquire it.
+PlistDict AppStore::resolve_download(const Account& acc, const App& app,
+                                     const std::string& guid,
+                                     const std::string& externalVersionID,
+                                     const std::string& redownloadEndpoint,
+                                     const std::string& volumeStoreDownloadEndpoint,
+                                     const std::string& kbsyncB64,
+                                     bool isMac, bool needSinfs)
+{
+    auto served = [&](const PlistDict& d) {
+        auto sl = dict_arr(d, "songList");
+        if (sl.empty()) return false;
+        return needSinfs ? has_sinfs(sl) : true;
+    };
+    // failureType, falling back to metrics.messageCode (Apple wraps 2042 there).
+    auto failure_of = [](const PlistDict& d) {
+        std::string ft = dict_str(d, "failureType");
+        if (ft.empty()) {
+            auto it = d.find("metrics");
+            if (it != d.end() && it->second.isDict())
+                ft = dict_str(it->second.dictVal, "messageCode");
+        }
+        return ft;
+    };
+
+    PlistDict   vsData;          // step-1 response, kept for final error mapping
+    std::string vsFailure;
+    std::string customerMessage; // best-effort message for the final error
+
+    // ── 1) volumeStoreDownloadProduct (bag, kbsync) ─────────────────────────
+    if (!volumeStoreDownloadEndpoint.empty() && !kbsyncB64.empty()) {
+        std::string kb = kbsyncB64;               // may be swapped for a fresh blob below
+        int st = 0;
+        vsData = volume_store_download_product(acc, app, guid, volumeStoreDownloadEndpoint,
+                                               kb, externalVersionID,
+                                               /*authed=*/false, st);
+        if (served(vsData)) return vsData;
+
+        // HTTP >= 500 here means the kbsync blob was rejected (it is bound to
+        // DSID + hardwareID and goes stale). Regenerate it ONCE and retry this
+        // endpoint right away with the fresh blob — a stale kbsync shouldn't cost
+        // a whole second run. The fresh blob is handed to the caller to cache.
+        // If the retry is still >= 500 the kbsync is fresh, so it is not the
+        // problem: we stop retrying here and fall through to the cascade with the
+        // same failure handling as the first attempt.
+        if (st >= 500) {
+            try {
+                uint64_t dsid = std::stoull(acc.directoryServicesID);
+                std::string fresh = SapBase64::Encode(generate_kbsync(dsid));
+                if (!fresh.empty()) {
+                    m_regeneratedKbsync = fresh;   // caller caches this instead of clearing
+                    kb = fresh;
+                    if (m_debug)
+                        fprintf(stderr, "[DEBUG] volumeStoreDownload HTTP %d - regenerated kbsync, retrying\n", st);
+                    int stR = 0;
+                    vsData = volume_store_download_product(acc, app, guid, volumeStoreDownloadEndpoint,
+                                                           kb, externalVersionID,
+                                                           /*authed=*/false, stR);
+                    if (served(vsData)) return vsData;
+                    st = stR;                      // keep handling errors on the retry response
+                }
+            } catch (const std::exception& e) {
+                if (m_debug) fprintf(stderr, "[DEBUG] kbsync regeneration failed (%s)\n", e.what());
+            }
+        }
+
+        vsFailure = failure_of(vsData);
+
+        // 2042 AuthTokenResumeFreeBuy → one retry with hasBeenAuthedForBuy
+        // (equivalent of clicking "Download" in the confirmation dialog).
+        if (vsFailure == FAILURE_SIGN_IN_REQUIRED) {
+            auto dit = vsData.find("dialog");
+            bool authDialog = (dit != vsData.end() && dit->second.isDict() &&
+                               dict_str(dit->second.dictVal, "kind") == "authorization");
+            if (authDialog) {
+                if (m_debug)
+                    fprintf(stderr, "[DEBUG] volumeStoreDownload auth dialog - retrying with hasBeenAuthedForBuy\n");
+                int st2 = 0;
+                vsData = volume_store_download_product(acc, app, guid, volumeStoreDownloadEndpoint,
+                                                       kb, externalVersionID,
+                                                       /*authed=*/true, st2);
+                if (served(vsData)) return vsData;
+                vsFailure = failure_of(vsData);
+            }
+        }
+        // A token / sign-in / device-verification failure is a session issue, not a
+        // missing license: surface it so the caller re-logs-in.
+        if (vsFailure == FAILURE_PASSWORD_TOKEN_EXPIRED ||
+            vsFailure == FAILURE_SIGN_IN_REQUIRED       ||
+            vsFailure == FAILURE_DEVICE_VERIFICATION)
+            throw PasswordTokenExpired();
+        if (dict_str(vsData, "customerMessage") == CUSTOMER_MSG_SIGN_IN)
+            throw PasswordTokenExpired();
+        if (!dict_str(vsData, "customerMessage").empty())
+            customerMessage = dict_str(vsData, "customerMessage");
+    }
+
+    // Version pin, shared by redownload and updateProduct (empty = unpinned).
+    std::string pin = isMac ? externalVersionID
+                            : redownload_version_id(acc, app, externalVersionID);
+
+    // ── 2) redownloadProduct, then 3) updateProduct ─────────────────────────
+    bool rdUnavailable = false;
+    if (!redownloadEndpoint.empty()) {
+        int rdStatus = 0;
+        PlistDict rd = redownload_product(acc, app, guid, redownloadEndpoint,
+                                          pin, "redownloadProduct", rdStatus);
+        if (served(rd)) return rd;
+
+        rdUnavailable = (rdStatus != 500 && is_redownload_unavailable(rd));
+        if (!dict_str(rd, "customerMessage").empty())
+            customerMessage = dict_str(rd, "customerMessage");
+
+        // Try updateProduct whenever redownload did not serve: an empty HTTP 500,
+        // a "No Longer Available" message, an "unavailable" dialog, a download
+        // without sinf data, or simply an empty songList. We run the full cascade
+        // regardless, since without library state we cannot know the entitlement.
+        bool wantUpdate = (rdStatus == 500 && rd.empty())
+                       || is_unavailable_response(rdStatus, rd)
+                       || rdUnavailable
+                       || (needSinfs && rdStatus == 200 && dict_str(rd, "failureType").empty()
+                           && !has_sinfs(dict_arr(rd, "songList")))
+                       || (!needSinfs && dict_arr(rd, "songList").empty());
+
+        if (wantUpdate && !pin.empty() && !m_updateEndpoint.empty()) {
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] redownloadProduct did not serve - trying updateProduct\n");
+            try {
+                PlistDict up = update_product(acc, app, guid, pin);
+                if (served(up)) return up;
+                if (!dict_str(up, "customerMessage").empty())
+                    customerMessage = dict_str(up, "customerMessage");
+                // updateProduct returned a structured failure without items.
+                if (rdUnavailable) throw LicenseRequired();
+            } catch (const PasswordTokenExpired&) {
+                throw;                       // session issue — must re-login
+            } catch (const LicenseRequired&) {
+                throw;                       // keep the license signal for --purchase
+            } catch (const IpaError& e) {
+                // updateProduct refused/errored. If redownload had already said the
+                // item is unavailable for this account, that is a missing license.
+                if (rdUnavailable) throw LicenseRequired();
+                if (customerMessage.empty()) customerMessage = e.what();
+            }
+        } else if (rdUnavailable) {
+            throw LicenseRequired();
+        }
+    }
+
+    // ── Nothing served: map to the exception the caller expects ─────────────
+    if (vsFailure == FAILURE_LICENSE_NOT_FOUND) throw LicenseRequired();
+    if (!customerMessage.empty())               throw IpaError(customerMessage);
+    if (dict_str(vsData, "jingleDocType") == "purchaseSuccess")
+        throw IpaError("app is not available for download in your region/storefront"
+                       " (license was granted but download was blocked)");
+    if (!vsFailure.empty())                     throw IpaError("received error: " + vsFailure);
+    throw IpaError("invalid response: empty songList");
+}
+
+// ── redownloadProduct (bag) — re-acquire from the account's purchase history.
+// Pure endpoint call: POST, decode, return the response and its HTTP status. The
+// cascade decisions (whether to fall on to updateProduct, when to conclude a
+// missing license) live in resolve_download. `pin` is the version id, computed by
+// the caller (empty = unpinned).
+PlistDict AppStore::redownload_product(const Account& acc, const App& app,
+                                       const std::string& guid,
+                                       const std::string& redownloadEndpoint,
+                                       const std::string& pin,
+                                       const char* label,
+                                       int& httpStatus)
+{
+    httpStatus = 0;
+    auto        hdrs = download_request_headers(acc);
+    std::string body = download_request_payload(guid, app, pin);
+    std::string url  = redownloadEndpoint + "?guid=" + guid;
+
+    HttpResponse res = prov_post(label, url, body, hdrs, kAnonAdiDSID, guid,
+                    acc.passwordToken.get(), acc.storeFront);
+    httpStatus = res.statusCode;
+
+    return decode_plist_safe(res.body);
+}
+
+PlistDict AppStore::update_product(const Account& acc, const App& app,
+                                        const std::string& guid,
+                                        const std::string& externalVersionID)
+{
+    // updateProduct endpoint comes straight from the bag (resolve_download only
+    // calls this when it is non-empty) — trusted like every other bag endpoint.
+    auto        hdrs = download_request_headers(acc);
+    std::string body = download_request_payload(guid, app, externalVersionID);
+    std::string url  = m_updateEndpoint + "?guid=" + guid;
+
+    HttpResponse res = prov_post("updateProduct", url, body, hdrs, kAnonAdiDSID, guid,
+                    acc.passwordToken.get(), acc.storeFront);
+
+    PlistDict data = decode_plist_safe(res.body);
+
+    // Structured failures keep their normal handling in the caller.
+    if (!dict_str(data, "failureType").empty())
+        return data;
+
+    std::string customerMessage = dict_str(data, "customerMessage");
+    if (!customerMessage.empty())
+        throw IpaError("received update error: " + customerMessage);
+
+    if (res.statusCode != 200)
+        throw IpaError("received unexpected update status code: "
+                       + std::to_string(res.statusCode));
+
+    auto items = dict_arr(data, "songList");
+    if (items.size() != 1 || !items[0].isDict())
+        throw IpaError("update response must contain exactly one item");
+
+    auto metaIt = items[0].dictVal.find("metadata");
+    if (metaIt == items[0].dictVal.end() || !metaIt->second.isDict())
+        throw IpaError("update response does not match the requested app or version");
+    const PlistDict& meta = metaIt->second.dictVal;
+
+    if (plist_scalar_str(meta, "itemId") != std::to_string(app.id) ||
+        plist_scalar_str(meta, "softwareVersionExternalIdentifier") != externalVersionID)
+        throw IpaError("update response does not match the requested app or version");
+
+    std::string bundleID = dict_str(meta, "softwareVersionBundleId");
+    if (bundleID.empty() || (!app.bundleID.empty() && bundleID != app.bundleID))
+        throw IpaError("update response does not match the requested bundle identifier");
+
+    return data;
+}
+
+// ── Platform version lookup ──────────────────────────────────────────────
+// Port of upstream pkg/appstore/appstore_platform_version_lookup.go,
+// including e5211d6 "fall back to consumer catalogs for ios version lookup".
+
+// externalId may arrive as a JSON string or number (upstream UnmarshalJSON).
+static std::string platform_external_id_to_string(const json& v) {
+    if (v.is_string())          return v.get<std::string>();
+    if (v.is_number_unsigned()) return std::to_string(v.get<uint64_t>());
+    if (v.is_number_integer())  return std::to_string(v.get<int64_t>());
+    if (v.is_null())            return "";
+    throw IpaError("invalid external version id " + v.dump());
+}
+
+// buyParams is a query string: "...&appExtVrsId=123456&..."
+static std::string external_version_id_from_buy_params(const std::string& buyParams) {
+    std::istringstream ss(buyParams);
+    std::string kv;
+    while (std::getline(ss, kv, '&')) {
+        auto eq = kv.find('=');
+        if (eq != std::string::npos && kv.compare(0, eq, "appExtVrsId") == 0)
+            return kv.substr(eq + 1);
+    }
+    return "";
+}
+
+std::string AppStore::lookup_latest_external_version_id(const Account& acc, const App& app) {
+    if (app.id == 0)
+        throw IpaError("app ID is required for platform version lookup");
+
+    std::string cc = country_code_from_storefront(acc.storeFront);
+    std::transform(cc.begin(), cc.end(), cc.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+
+    // Some storefronts have no enterprise listing even when the consumer
+    // catalogs contain the app. Keep the account's country for each lookup.
+    static const char* const kCatalogs[] = { "enterprisestore", "iphone", "ipad" };
+
+    const std::string appKey = std::to_string(app.id);
+    std::string lastErr;
+
+    for (const char* catalog : kCatalogs) {
+        std::map<std::string, std::string> p = {
+            {"version",  "2"},
+            {"id",       appKey},
+            {"p",        "mdm-lockup"},
+            {"caller",   "MDM"},
+            {"platform", catalog},
+            {"cc",       cc},
+            {"l",        "en"},
+        };
+        std::string url = "https://uclient-api.itunes.apple.com/WebObjects/"
+                          "MZStorePlatform.woa/wa/lookup?" + build_query(p);
+
+        HttpResponse res = m_http.get(url);
+        if (m_debug)
+            fprintf(stderr, "[DEBUG] platform version lookup (%s) status: %d\n",
+                    catalog, res.statusCode);
+        if (res.statusCode != 200)
+            throw IpaError("platform version lookup request failed: "
+                           + std::to_string(res.statusCode));
+
+        json j = json::parse(res.body, nullptr, /*allow_exceptions=*/false);
+        if (j.is_discarded())
+            throw IpaError("platform version lookup returned invalid JSON");
+
+        const json* item = nullptr;
+        auto rIt = j.find("results");
+        if (rIt != j.end() && rIt->is_object()) {
+            auto aIt = rIt->find(appKey);
+            if (aIt != rIt->end() && aIt->is_object()) item = &*aIt;
+        }
+        if (!item) {
+            lastErr = "platform version lookup returned no app";
+            continue;
+        }
+
+        auto oIt = item->find("offers");
+        if (oIt == item->end() || !oIt->is_array() || oIt->empty()
+            || !(*oIt)[0].is_object()) {
+            lastErr = "platform version lookup returned no offers";
+            continue;
+        }
+        const json& offer = (*oIt)[0];
+
+        std::string externalVersionID;
+        auto vIt = offer.find("version");
+        if (vIt != offer.end() && vIt->is_object()) {
+            auto eIt = vIt->find("externalId");
+            if (eIt != vIt->end())
+                externalVersionID = platform_external_id_to_string(*eIt);
+        }
+        if (externalVersionID.empty()) {
+            auto bIt = offer.find("buyParams");
+            if (bIt != offer.end() && bIt->is_string())
+                externalVersionID = external_version_id_from_buy_params(bIt->get<std::string>());
+        }
+        if (externalVersionID.empty())
+            throw IpaError("platform version lookup returned no external version id");
+
+        if (m_debug)
+            fprintf(stderr, "[DEBUG] platform version lookup (%s): externalVersionId=%s\n",
+                    catalog, externalVersionID.c_str());
+        return externalVersionID;
+    }
+
+    throw IpaError("app " + appKey + " in storefront " + cc
+                   + " (catalogs: enterprisestore, iphone, ipad): " + lastErr);
+}
+
+std::string AppStore::redownload_version_id(const Account& acc, const App& app,
+                                            const std::string& externalVersionID) {
+    if (!externalVersionID.empty()) return externalVersionID;
+    try {
+        return lookup_latest_external_version_id(acc, app);
+    } catch (const std::exception& e) {
+        // Upstream aborts here; we keep the previous unpinned redownload so
+        // apps that already worked are not broken by a lookup failure.
+        if (m_debug)
+            fprintf(stderr, "[DEBUG] %s - sending unpinned redownload\n", e.what());
+        return "";
+    }
+}
+
+// ── Bag (fetch bag.xml: all download/auth endpoints + SAP config) ───────────
+
+// Fetch and parse bag.xml. Called with no guid by external callers (uses
+// get_guid()); login() passes its own guid so the whole flow shares one identity.
+PlistDict AppStore::request_bag(const std::string& query,
+                                const std::map<std::string, std::string>& headers,
+                                const char* label) {
+    std::string url = std::string("https://") + PRIVATE_INIT_DOMAIN + PRIVATE_INIT_PATH + query;
+    HttpResponse res = m_http.get(url, headers);
+
+    // Bag body is huge — log only status and size.
+    if (m_debug)
+        fprintf(stderr, "[DEBUG] %s status: %d (%zu bytes)\n",
+                label, res.statusCode, res.body.size());
+
+    if (res.statusCode != 200)
+        throw IpaError(std::string(label) + " request failed: " + std::to_string(res.statusCode));
+
+    PlistDict d = decode_plist(res.body);
+
+    // Signed form: {bag = <data: nested plist>, certs, signature}
+    bool signedBag = false;
+    if (auto it = d.find("bag"); it != d.end() && it->second.isData()) {
+        std::string inner(it->second.dataVal.begin(), it->second.dataVal.end());
+        d = decode_plist(inner);
+        signedBag = true;
+    }
+
+    // --debug: report which keys we rely on are present.
+    if (m_debug) {
+        const PlistDict* ub = &d;
+        if (auto u = d.find("urlBag"); u != d.end() && u->second.isDict()) ub = &u->second.dictVal;
+        std::string report = std::string(label) + " (" + query + "): " +
+                             std::to_string(res.body.size()) + " B, " +
+                             (signedBag ? "signed" : "plain") + ", " +
+                             (ub != &d ? "urlBag" : "flat") + ", " +
+                             std::to_string(ub->size()) + " keys";
+        static const char* kKeys[] = {
+            "authenticateAccount", "sign-sap-setup", "sign-sap-setup-cert", "sign-sap-version",
+            "volumeStoreDownloadProduct", "redownloadProduct", "updateProduct",
+            "songDownloadDone", "buyProduct",
+            "md-finish-provisioning", "amd-finish-provisioning",
+            "md-sync-machine", "amd-sync-machine",
+        };
+        for (const char* k : kKeys) {
+            std::string v = bag_find(d, k);
+            report += "\n        " + std::string(k) + " = " + (v.empty() ? "<absent>" : clip(v, 110));
+        }
+        prov_log(report);
+    }
+    return d;
+}
+
+AppStore::BagOutput AppStore::fetch_bag(const std::string& guidArg) {
+    std::string guid = guidArg.empty() ? get_guid() : guidArg;
+
+    // One bag for everything — bag.xml?guid=&ix=6 requested as Configurator
+    // 2.21 (OS X 15.7). It is plain and flat (no urlBag) and holds the native
+    // authenticate endpoint, SAP config, download endpoints and the md-/amd-
+    // provisioning URLs.
+    PlistDict d = request_bag("?guid=" + guid + "&ix=6", {
+        {"Accept",     "application/xml"},
+        {"User-Agent", PROV_AUTH_UA},
+    }, "native bag");
+
+    BagOutput out;
+
+    // Endpoints + SAP config: under urlBag when present, otherwise flat.
+    auto ubIt = d.find("urlBag");
+    const PlistDict& ub = (ubIt != d.end() && ubIt->second.isDict()) ? ubIt->second.dictVal : d;
+    out.redownloadEndpoint          = dict_str(ub, "redownloadProduct");
+    out.updateEndpoint              = dict_str(ub, "updateProduct");
+    out.volumeStoreDownloadEndpoint = dict_str(ub, "volumeStoreDownloadProduct");
+    out.songDownloadDoneEndpoint    = dict_str(ub, "songDownloadDone");
+    m_updateEndpoint                = out.updateEndpoint;
+    out.signSapSetup     = dict_str(ub, "sign-sap-setup");
+    out.signSapSetupCert = dict_str(ub, "sign-sap-setup-cert");
+    if (std::string sapVer = dict_str(ub, "sign-sap-version"); !sapVer.empty()) {
+        try { out.sapVersion = (uint32_t)std::stoul(sapVer); } catch (...) {}
+    }
+
+    // Convert guid "AABBCCDDEEFF" → raw bytes for SapSigner::Config
+    for (size_t i = 0; i + 1 < guid.size(); i += 2) {
+        try { out.hardwareID.push_back((uint8_t)std::stoul(guid.substr(i,2),nullptr,16)); }
+        catch (...) { break; }
+    }
+
+    out.mdFinishProvisioning  = bag_find(d, "md-finish-provisioning");
+    out.amdFinishProvisioning = bag_find(d, "amd-finish-provisioning");
+    out.mdSyncMachine         = bag_find(d, "md-sync-machine");
+    out.amdSyncMachine        = bag_find(d, "amd-sync-machine");
+    if (!out.mdFinishProvisioning.empty())  m_bagMdFinish  = out.mdFinishProvisioning;
+    if (!out.amdFinishProvisioning.empty()) m_bagAmdFinish = out.amdFinishProvisioning;
+    if (!out.mdSyncMachine.empty())         m_bagMdSync    = out.mdSyncMachine;
+    if (!out.amdSyncMachine.empty())        m_bagAmdSync   = out.amdSyncMachine;
+
+    // Native endpoint is used exactly as advertised — no path-addend
+    // rewriting and no trailing '/', as PR #5 does; .../native/fast
+    // answered MD-less requests with an empty 204 in our tests.
+    out.authEndpoint = bag_find(d, "authenticateAccount");
+    if (out.authEndpoint.empty()) {
+        out.authEndpoint = "https://auth.itunes.apple.com/auth/v1/native";
+        prov_log("bag has no authenticateAccount - using " + out.authEndpoint);
+    }
+    return out;
+
+}
+
+// ── Login implementation ─────────────────────────────────────────────────
+
+// ── Debug helpers for the SAP-signed authenticate request ────────────────
+// The authenticate request/response plists carry credentials (password/PET,
+// passwordToken, clearToken) and account PII (Apple ID, name, DSIDs) — mask them
+// all (equal-length) so --debug output can be shared safely. creditBalance /
+// freeSongBalance are left visible on purpose (useful, not identifying).
+static std::string mask_plist_credentials(const std::string& body) {
+    std::string out = body;
+    for (const char* key : {
+             "password", "passwordToken", "clearToken",   // credentials
+             "appleId", "firstName", "lastName",           // identity / PII
+             "altDsid", "dsPersonId", "dsid",              // account identifiers
+         })
+        ipt::mask_plist_field(out, key);
+    return out;
+}
+
+static void debug_dump_auth_request(const std::string& url,
+                                    const std::map<std::string, std::string>& headers,
+                                    const std::string& body) {
+    // The credential is always masked — password or short-lived PET alike.
+    debug_dump_request("SAP-signed authenticate", "POST", url, headers,
+                       mask_plist_credentials(body));
+}
+
+static void debug_dump_auth_response(const HttpResponse& res) {
+    // A 302 pod redirect echoes our request plist back in its body, and a success
+    // response carries the fresh passwordToken — mask both like the request.
+    HttpResponse masked = res;
+    masked.body = mask_plist_credentials(res.body);
+    debug_dump_response("authenticate", masked);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Private: login / purchase (implementation)
+// ─────────────────────────────────────────────────────────────────────────────
+
+Account AppStore::do_login(const std::string& email,
+                 const std::string& password,
+                 const std::string& guid,
+                 const std::string& baseEndpoint,
+                 SapSigner& signer)
+{
+    std::string  currentURL   = baseEndpoint;
+    bool         retry        = true;
+    bool         fromRedirect = false;  // pod-redirect sets attempt=1 (Go v2.4.0 behaviour)
+    HttpResponse lastRes;
+    PlistDict    lastData;
+
+    for (int attempt = 1; retry && attempt <= 4; attempt++) {
+        // Pod redirect: Apple expects attempt=1, not the outer loop counter.
+        int requestAttempt = fromRedirect ? 1 : attempt;
+        fromRedirect = false;
+
+        // GSA already handled 2FA — the password here is always the PET, sent
+        // verbatim (no code appended).
+        PlistDict payload;
+        payload["appleId"]  = PlistValue::makeString(email);
+        payload["attempt"]  = PlistValue::makeString(std::to_string(requestAttempt));
+        payload["guid"]     = PlistValue::makeString(guid);
+        payload["password"] = PlistValue::makeString(password);
+        payload["rmp"]      = PlistValue::makeString("0");
+        payload["why"]      = PlistValue::makeString("signIn");
+
+        std::string body = encode_plist_xml(payload);
+
+        std::map<std::string, std::string> headers = {
+            {"Content-Type", "application/x-apple-plist"},
+            {"User-Agent",   PROV_AUTH_UA},
+        };
+
+        // SAP-sign the request body (v2.4.0+)
+        // Never send an unsigned attempt — it would only burn a sign-in try.
+        try {
+            auto sigBytes = signer.Sign(std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(body.data()), body.size()));
+            headers[HTTP_HEADER_SAP_SIGNATURE] = SapBase64::Encode(sigBytes);
+            if (m_debug)
+                fprintf(stderr, "[DEBUG] SAP signature: %zu bytes\n", sigBytes.size());
+        } catch (const std::exception& e) {
+            throw IpaError(std::string("failed to sign login request: ") + e.what());
+        }
+
+        // Up to 2 extra sends when the server asks for an ADI action. The
+        // first send carries MD only if DSID -1 is already provisioned;
+        // otherwise the native endpoint answers SP and prov_handle provisions.
+        const std::map<std::string, std::string> baseHeaders = headers;
+        for (int provRound = 0; provRound < 3; ++provRound) {
+            headers = baseHeaders;
+            prov_add_md(headers, kAnonAdiDSID, "authenticate");
+
+            // Transport retry: up to 3 sends on 5xx (250ms×attempt). 429 is a
+            // hard stop; 204/404 from the native endpoint mean "rejected", and
+            // every resend is a counted sign-in attempt, so they are final.
+            lastRes = {};
+            for (int tx = 1; tx <= 3; ++tx) {
+                if (m_debug) debug_dump_auth_request(currentURL, headers, body);
+                lastRes = m_http.post(currentURL, body, headers);
+                if (m_debug) debug_dump_auth_response(lastRes);
+                int sc = lastRes.statusCode;
+                if (sc == 429)
+                    throw IpaError("rate limited by Apple (HTTP 429): " + lastRes.body);
+                if (sc == 204 || sc == 404)
+                    prov_log("authenticate: HTTP " + std::to_string(sc) + " - not retrying");
+                if (sc / 100 != 5) break;
+                if (m_debug)
+                    fprintf(stderr, "[DEBUG] auth HTTP %d - transport retry %d/3\n", sc, tx);
+                if (tx < 3)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(tx * 250));
+            }
+
+            if (!prov_handle("authenticate", lastRes, kAnonAdiDSID, guid, "")) break;
+            prov_log("authenticate: resending (round " + std::to_string(provRound + 2) + ")");
+        }
+
+        lastData = decode_plist(lastRes.body);
+
+        std::string failureType     = dict_str(lastData, "failureType");
+        std::string customerMessage = dict_str(lastData, "customerMessage");
+
+        // The native endpoint may omit dsPersonId from the body and carry
+        // the DSID in the x-dsid response header instead.
+        if (dict_str(lastData, "dsPersonId").empty()) {
+            auto h = lastRes.headers.find("x-dsid");
+            if (h != lastRes.headers.end() && !h->second.empty() &&
+                h->second.find_first_not_of("0123456789") == std::string::npos) {
+                lastData["dsPersonId"] = PlistValue::makeString(h->second);
+                prov_log("authenticate: DSID taken from x-dsid header");
+            }
+        }
+        // Native redirects (relative Location allowed); stay on auth.itunes.
+        int sc = lastRes.statusCode;
+        if (sc == 301 || sc == 302 || sc == 307 || sc == 308) {
+            auto loc = lastRes.headers.find("location");
+            if (loc == lastRes.headers.end() || loc->second.empty())
+                throw IpaError("native authentication redirect has no location (HTTP " +
+                               std::to_string(sc) + ")");
+            std::string target = loc->second;
+            if (target.rfind("/auth/", 0) == 0) target = "https://auth.itunes.apple.com" + target;
+            if (target.rfind("https://auth.itunes.apple.com/auth/", 0) != 0)
+                throw IpaError("unexpected native authentication redirect: " + target);
+            prov_log("authenticate: redirect -> " + target);
+            currentURL   = target;
+            fromRedirect = true;
+            retry        = true;
+            continue;
+        }
+
+        if (failureType.empty() && customerMessage == CUSTOMER_MSG_BAD_LOGIN) {
+            // We sent a valid, 2FA-complete PET — if the native endpoint still
+            // rejects it, that's a server/transport failure, not a credential
+            // problem. Fail hard; no 2FA prompt, no retry.
+            throw IpaError("native authentication rejected the PET");
+        } else if (failureType.empty()
+                   && customerMessage == CUSTOMER_MSG_ACCOUNT_DISABLED) {
+            throw IpaError("account is disabled");
+        } else if (!failureType.empty()) {
+            throw IpaError(!customerMessage.empty() ? customerMessage : "something went wrong");
+        } else if (lastRes.statusCode != 200
+                   || dict_str(lastData, "passwordToken").empty()
+                   || dict_str(lastData, "dsPersonId").empty()) {
+            throw IpaError("something went wrong (status="
+                           + std::to_string(lastRes.statusCode) + ")");
+        } else {
+            retry = false;
+        }
+    }
+
+    if (retry) throw IpaError("too many login attempts");
+
+    std::string sf, pod;
+    {
+        auto it = lastRes.headers.find(str_lower(HTTP_HEADER_STOREFRONT));
+        if (it != lastRes.headers.end()) sf = it->second;
+    }
+    {
+        auto it = lastRes.headers.find(str_lower(HTTP_HEADER_POD));
+        if (it != lastRes.headers.end()) pod = it->second;
+    }
+
+    auto addrDict = dict_dict(dict_dict(lastData, "accountInfo"), "address");
+
+    Account acc;
+    acc.firstName           = dict_str(addrDict, "firstName");
+    acc.lastName            = dict_str(addrDict, "lastName");
+    acc.name                = acc.firstName + " " + acc.lastName;
+    acc.email               = dict_str(dict_dict(lastData, "accountInfo"), "appleId");
+    acc.passwordToken.set(  dict_str(lastData, "passwordToken"));
+    acc.directoryServicesID = dict_str(lastData, "dsPersonId");
+    acc.storeFront          = sf;
+    acc.password.set(       password);
+    acc.pod                 = pod;
+    acc.fserial             = make_fserial(guid);  // fictitious device serial for volumeStoreDownload
+    return acc;
+}
+
+// ── Purchase implementation ───────────────────────────────────────────────
+
+PlistDict AppStore::do_purchase(const Account& acc, const App& app,
+                     const std::string& guid, const std::string& pricingParam)
+{
+    std::string pod_prefix;
+    if (!acc.pod.empty()) pod_prefix = "p" + acc.pod + "-";
+
+    std::string url = "https://" + pod_prefix + std::string(PRIVATE_AS_DOMAIN)
+                    + PRIVATE_AS_PATH_PURCHASE;
+
+    PlistDict payload;
+    payload["appExtVrsId"]               = PlistValue::makeString("0");
+    payload["hasAskedToFulfillPreorder"] = PlistValue::makeString("true");
+    payload["buyWithoutAuthorization"]   = PlistValue::makeString("true");
+    payload["hasDoneAgeCheck"]           = PlistValue::makeString("true");
+    payload["guid"]                      = PlistValue::makeString(guid);
+    payload["needDiv"]                   = PlistValue::makeString("0");
+    payload["origPage"]                  = PlistValue::makeString("Software-" + std::to_string(app.id));
+    payload["origPageLocation"]          = PlistValue::makeString("Buy");
+    payload["price"]                     = PlistValue::makeString("0");
+    payload["pricingParameters"]         = PlistValue::makeString(pricingParam);
+    payload["productType"]               = PlistValue::makeString("C");
+    payload["salableAdamId"]             = PlistValue::makeInt(app.id);
+
+    std::map<std::string, std::string> headers = {
+        {"Content-Type",        "application/x-apple-plist"},
+        {"iCloud-DSID",         acc.directoryServicesID},
+        {"X-Dsid",              acc.directoryServicesID},
+        {"X-Apple-Store-Front", acc.storeFront},
+        {"X-Token",             acc.passwordToken.get()},
+    };
+
+    std::string body = encode_plist_xml(payload);
+    HttpResponse res = prov_post("buyProduct", url, body, headers,
+                    kAnonAdiDSID, guid, acc.passwordToken.get(), acc.storeFront);
+    PlistDict    data  = decode_plist(res.body);
+
+    std::string failureType     = dict_str(data, "failureType");
+    std::string customerMessage = dict_str(data, "customerMessage");
+    std::string jingleDocType   = dict_str(data, "jingleDocType");
+    int64_t     status          = dict_int(data, "status");
+
+    if (failureType == FAILURE_TEMPORARILY_UNAVAILABLE)   throw IpaError("item is temporarily unavailable");
+    if (failureType == FAILURE_ALREADY_PURCHASED)         throw IpaError("license already exists");
+    if (customerMessage == CUSTOMER_MSG_SUBSCRIPTION_REQ) throw SubscriptionRequired();
+    if (failureType == FAILURE_PASSWORD_TOKEN_EXPIRED)    throw PasswordTokenExpired();
+    if (customerMessage == CUSTOMER_MSG_SIGN_IN)          throw PasswordTokenExpired();
+    if (!failureType.empty() && !customerMessage.empty()) throw IpaError(customerMessage);
+    if (!failureType.empty())                             throw IpaError("something went wrong");
+    if (res.statusCode == 500)                            throw IpaError("license already exists");
+    if (jingleDocType != "purchaseSuccess" || status != 0)
+        throw IpaError("failed to purchase app");
+
+    // Return full result — caller can use songList if present (paid apps)
+    return data;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Private: IPA patching
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── ZIP patching ──────────────────────────────────────────────────────────
+// Injects a patched iTunesMetadata.plist into the downloaded IPA.
+// Uses minizip when available; falls back to a pure C++ copy without patching.
+
+void AppStore::apply_patches(const PlistDict& item,
+                   const Account&   acc,
+                   const std::string& srcPath,
+                   const std::string& dstPath,
+                   const std::vector<Sinf>& sinfs)
+{
+#ifdef HAVE_MINIZIP
+    auto metaIt = item.find("metadata");
+    PlistDict metadata;
+    if (metaIt != item.end() && metaIt->second.isDict())
+        metadata = metaIt->second.dictVal;
+
+    // Add account identity fields
+    metadata["appleId"]  = PlistValue::makeString(acc.email);
+    metadata["userName"] = PlistValue::makeString(acc.name);
+
+    // purchaseDate — current download time (iTunes uses download time, not purchase time)
+    time_t now = std::time(nullptr);
+    std::string purchaseDateStr;
+    {
+        struct tm t;
+#ifdef _WIN32
+        gmtime_s(&t, &now);
+#else
+        gmtime_r(&now, &t);
+#endif
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+                 t.tm_year+1900, t.tm_mon+1, t.tm_mday,
+                 t.tm_hour, t.tm_min, t.tm_sec);
+        purchaseDateStr = buf;
+    }
+
+    // Construct com.apple.iTunesStore.downloadInfo — mirrors what iTunes writes
+    {
+        PlistDict accountInfo;
+        accountInfo["AppleID"]          = PlistValue::makeString(acc.email);
+        accountInfo["UserName"]         = PlistValue::makeString(acc.name);
+        accountInfo["AccountStoreFront"]= PlistValue::makeString(acc.storeFront);
+        accountInfo["DSPersonID"]       = PlistValue::makeInt(
+                                            std::stoll(acc.directoryServicesID.empty() ? "0" : acc.directoryServicesID));
+        accountInfo["PurchaserID"]      = PlistValue::makeInt(
+                                            std::stoll(acc.directoryServicesID.empty() ? "0" : acc.directoryServicesID));
+        accountInfo["DownloaderID"]     = PlistValue::makeInt(0);
+        accountInfo["FamilyID"]         = PlistValue::makeInt(0);
+        accountInfo["FirstName"]        = PlistValue::makeString(acc.firstName);
+        accountInfo["LastName"]         = PlistValue::makeString(acc.lastName);
+
+        PlistDict downloadInfo;
+        downloadInfo["accountInfo"]  = PlistValue::makeDict(accountInfo);
+        downloadInfo["purchaseDate"] = PlistValue::makeString(purchaseDateStr);
+
+        metadata["com.apple.iTunesStore.downloadInfo"] = PlistValue::makeDict(downloadInfo);
+    }
+
+    // is-purchased-redownload: true (always set by iTunes for purchased apps)
+    metadata["is-purchased-redownload"] = PlistValue::makeBool(true);
+    metadata["purchaseDate"] = PlistValue::makeDate(purchaseDateStr);
+
+    // storeCohort — constructed by iTunes using current time + storefront number
+    {
+        // Extract numeric storefront ID (e.g. "143441-16,32" → "143441")
+        std::string sf = acc.storeFront;
+        size_t dash = sf.find('-');
+        if (dash != std::string::npos) sf = sf.substr(0, dash);
+        // Current time in milliseconds
+        int64_t ms = (int64_t)now * 1000LL;
+        char cohort[256];
+        snprintf(cohort, sizeof(cohort),
+                 "10|date=%lld&sf=%s&app=com.apple.iTunes&pgtp=Purchases&prpg=Purchases",
+                 (long long)ms, sf.c_str());
+        metadata["storeCohort"] = PlistValue::makeString(cohort);
+    }
+
+    std::string metaStr  = encode_plist_xml(metadata);
+    std::vector<uint8_t> metaBytes(metaStr.begin(), metaStr.end());
+
+    // Download iTunesArtwork
+    std::vector<uint8_t> artworkBytes;
+    try {
+        std::string artworkURL = dict_str(item, "artworkURL");
+        if (!artworkURL.empty()) {
+            HttpResponse artRes = m_http.get(artworkURL);
+            if (artRes.statusCode == 200 && !artRes.body.empty())
+                artworkBytes.assign(artRes.body.begin(), artRes.body.end());
+        }
+    }
+    catch (const std::exception& e) {
+        fprintf(stderr, "[WARN] Artwork Download Failed: %s\n", e.what());
+    }
+
+    patch_with_minizip(srcPath, dstPath, metaBytes, artworkBytes, sinfs);
+#else
+    std::error_code ec;
+    fs::copy_file(ipt::fs_path(srcPath), ipt::fs_path(dstPath),
+                  fs::copy_options::overwrite_existing, ec);
+    if (ec) throw IpaError("failed to copy IPA: " + ec.message());
+#endif
+}
+
+#ifdef HAVE_MINIZIP
+void AppStore::patch_with_minizip(const std::string& srcPath,
+                               const std::string& dstPath,
+                               const std::vector<uint8_t>& metaBytes,
+                               const std::vector<uint8_t>& artworkBytes,
+                               const std::vector<Sinf>& sinfs)
+{
+    // ── Step 1: raw-copy the original IPA → destination ──────────────────
+    {
+        std::ifstream in(ipt::fs_path(srcPath),  std::ios::binary);
+        std::ofstream out(ipt::fs_path(dstPath), std::ios::binary | std::ios::trunc);
+        if (!in)  throw IpaError("minizip: cannot open source IPA");
+        if (!out) throw IpaError("minizip: cannot create output IPA");
+        out << in.rdbuf();
+    }
+
+    // ── Step 2: collect bundle info needed for sinf path ─────────────────
+    std::string bundleName;
+    std::string bundleExecutable;
+    std::vector<std::string> sinfPaths;
+
+    if (!sinfs.empty()) {
+        unzFile probe = ipt_unzOpen(srcPath);
+        if (!probe) throw IpaError("minizip: cannot open source for probe");
+        int rc = unzGoToFirstFile(probe);
+        while (rc == UNZ_OK) {
+            char name[1024] = {};
+            unz_file_info fi;
+            unzGetCurrentFileInfo(probe, &fi, name, sizeof(name),
+                                  nullptr, 0, nullptr, 0);
+            std::string n(name);
+
+            if (bundleName.empty()
+                && n.find(".app/Info.plist") != std::string::npos
+                && n.find("/Watch/") == std::string::npos)
+            {
+                size_t appPos   = n.rfind(".app/Info.plist");
+                size_t slashPos = n.rfind('/', appPos - 1);
+                bundleName = n.substr(slashPos + 1, appPos - slashPos - 1);
+            }
+
+            if (bundleExecutable.empty()
+                && n.find(".app/Info.plist") != std::string::npos
+                && n.find("/Watch/") == std::string::npos)
+            {
+                unzOpenCurrentFile(probe);
+                std::vector<uint8_t> buf(fi.uncompressed_size);
+                unzReadCurrentFile(probe, buf.data(), (unsigned)buf.size());
+                unzCloseCurrentFile(probe);
+                bundleExecutable = extract_plist_string(buf, "CFBundleExecutable");
+            }
+
+            if (sinfPaths.empty()
+                && n.find(".app/SC_Info/Manifest.plist") != std::string::npos)
+            {
+                unzOpenCurrentFile(probe);
+                std::vector<uint8_t> buf(fi.uncompressed_size);
+                unzReadCurrentFile(probe, buf.data(), (unsigned)buf.size());
+                unzCloseCurrentFile(probe);
+                sinfPaths = extract_sinf_paths(buf);
+            }
+
+            rc = unzGoToNextFile(probe);
+        }
+        unzClose(probe);
+    }
+
+    // ── Step 3: open the copy in append mode and inject new files ─────────
+    zipFile dst = ipt_zipOpen(dstPath, APPEND_STATUS_ADDINZIP);
+    if (!dst) throw IpaError("minizip: failed to open output IPA for append");
+
+    // iTunes order: iTunesMetadata.plist first, sinf(s), iTunesArtwork last
+    auto append_file = [&](const char* path,
+                            const void* data, unsigned size,
+                            int method)
+    {
+        zip_fileinfo zfi = {};
+        zipOpenNewFileInZip(dst, path, &zfi,
+            nullptr, 0, nullptr, 0, nullptr,
+            method, method == 0 ? 0 : Z_DEFAULT_COMPRESSION);
+        zipWriteInFileInZip(dst, data, size);
+        zipCloseFileInZip(dst);
+    };
+
+    append_file("iTunesMetadata.plist",
+                metaBytes.data(), (unsigned)metaBytes.size(),
+                Z_DEFLATED);
+
+    if (!sinfs.empty() && !bundleName.empty()) {
+        if (!sinfPaths.empty()) {
+            size_t count = std::min(sinfs.size(), sinfPaths.size());
+            for (size_t i = 0; i < count; i++) {
+                std::string sp = "Payload/" + bundleName + ".app/" + sinfPaths[i];
+                append_file(sp.c_str(),
+                            sinfs[i].data.data(), (unsigned)sinfs[i].data.size(),
+                            Z_DEFLATED);
+            }
+        } else if (!bundleExecutable.empty()) {
+            std::string sp = "Payload/" + bundleName + ".app/SC_Info/"
+                           + bundleExecutable + ".sinf";
+            append_file(sp.c_str(),
+                        sinfs[0].data.data(), (unsigned)sinfs[0].data.size(),
+                        Z_DEFLATED);
+        }
+    }
+
+    if (!artworkBytes.empty())
+        append_file("iTunesArtwork",
+                    artworkBytes.data(), (unsigned)artworkBytes.size(),
+                    Z_DEFLATED);
+
+    zipClose(dst, nullptr);
+}
+
+// Extract a string value from a binary or XML plist by key name.
+// Binary plist keys and values are linked by object references.
+std::string AppStore::extract_plist_string(const std::vector<uint8_t>& data,
+                                         const std::string& key)
+{
+    const auto plist = decode_plist(std::string(data.begin(), data.end()));
+    const auto it = plist.find(key);
+    return it != plist.end() && it->second.isString() ? it->second.str() : "";
+}
+
+// Parse SinfPaths array from SC_Info/Manifest.plist (XML or binary plist)
+std::vector<std::string> AppStore::extract_sinf_paths(const std::vector<uint8_t>& data)
+{
+    const auto plist = decode_plist(std::string(data.begin(), data.end()));
+    std::vector<std::string> paths;
+    for (const auto& value : dict_arr(plist, "SinfPaths")) {
+        if (value.isString()) paths.push_back(value.str());
+    }
+    return paths;
+}
+#endif
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AppStore — Private: URL / path / string helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── URL builders ─────────────────────────────────────────────────────────
+
+std::string AppStore::search_url(const std::string& term,
+                               const std::string& cc, int limit)
+{
+    std::map<std::string, std::string> p = {
+        {"entity",  "software,iPadSoftware"},
+        {"limit",   std::to_string(limit)},
+        {"media",   "software"},
+        {"term",    term},
+        {"country", cc},
+    };
+    return std::string("https://") + ITUNES_API_DOMAIN
+         + ITUNES_API_PATH_SEARCH + "?" + build_query(p);
+}
+
+std::string AppStore::lookup_url(const std::string& bundleID,
+                               const std::string& cc)
+{
+    std::map<std::string, std::string> p = {
+        {"entity",   "software,iPadSoftware"},
+        {"limit",    "1"},
+        {"media",    "software"},
+        {"bundleId", bundleID},
+        {"country",  cc},
+    };
+    return std::string("https://") + ITUNES_API_DOMAIN
+         + ITUNES_API_PATH_LOOKUP + "?" + build_query(p);
+}
+
+// ── Path helpers (C++17 std::filesystem — no POSIX needed) ───────────────
+
+std::string AppStore::resolve_destination(const App& app,
+                                       const std::string& version,
+                                       const std::string& outputPath,
+                                       const std::string& displayName,
+                                       const std::string& ext)
+{
+    std::string fname = make_filename(app, version, displayName, ext);
+    if (outputPath.empty()) {
+        // fname is UTF-8: wrap it, or MSVC's fs::path reads the narrow string
+        // in the ANSI code page and the name comes back double-encoded.
+        return ipt::to_utf8(fs::current_path() / ipt::fs_path(fname));
+    }
+    // Keep the user's UTF-8 path intact: fs::path::string() returns the active
+    // ANSI code page on Windows, so join as plain UTF-8 instead of round-tripping.
+    if (fs::is_directory(ipt::fs_path(outputPath))) {
+        char last = outputPath.empty() ? '\0' : outputPath.back();
+        std::string sep = (last == '/' || last == '\\') ? "" : "/";
+        return outputPath + sep + fname;
+    }
+    return outputPath;
+}
+
+std::string AppStore::make_filename(const App& app, const std::string& version,
+                                    const std::string& displayName,
+                                    const std::string& ext) {
+    return build_base_filename(displayName, app, version) + ext;
+}
+
+int64_t AppStore::file_size(const std::string& path) {
+    std::error_code ec;
+    auto sz = fs::file_size(ipt::fs_path(path), ec);
+    return ec ? 0 : (int64_t)sz;
+}
+
+std::string AppStore::str_lower(const char* s) {
+    std::string out(s);
+    for (char& c : out) c = (char)tolower((unsigned char)c);
+    return out;
+}
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GSA (Grand Slam) login — local software-anisette (CoreADI), SRP-6a handshake,
+// MidService machine provisioning, 2FA and PET harvest. See gsa.h / srp.h.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GSA machine DSID (-2). Store anon provisioning uses kAnonAdiDSID (-1).
+static constexpr uint64_t kGsaMachineDSID = ~uint64_t(1);
+
+namespace {
+// ── Mac software-anisette identity (majd / akd parity) ───────────────────────
+// Every value derives from one persisted 16-byte seed, so provisioning and each
+// later GSA call present a single coherent machine. The Mid* provisioning URLs
+// come from the GSA bag (no hard-coded fallbacks) — see gsa_bag().
+constexpr const char* ANISETTE_CLIENT_INFO =
+    "<MacPro3,1> <Mac OS X;10.12.6;16G29> <com.apple.AuthKit/1 (com.apple.akd/1.0)>";
+constexpr const char* ANISETTE_UA =
+    "akd/1.0 CFNetwork/811.5.4 Darwin/16.7.0";
+
+std::string gsa_to_hex(const std::vector<uint8_t>& b) {
+    static const char* h = "0123456789abcdef";
+    std::string s; s.reserve(b.size() * 2);
+    for (uint8_t c : b) { s.push_back(h[c >> 4]); s.push_back(h[c & 0x0F]); }
+    return s;
+}
+
+// X-Apple-I-MD-LU = hex(sha256(seed)); X-Mme-Device-Id = hex(seed) laid out as a UUID.
+std::pair<std::string, std::string> gsa_identity(const std::vector<uint8_t>& seed) {
+    const std::string lu = gsa_to_hex(sha2::digest(seed));
+    const std::string hx = gsa_to_hex(seed);            // 32 hex of the 16-byte seed
+    const std::string dev = hx.substr(0, 8) + "-" + hx.substr(8, 4) + "-" +
+                            hx.substr(12, 4) + "-" + hx.substr(16, 4) + "-" + hx.substr(20, 12);
+    return { lu, dev };
+}
+
+// MidService envelope: empty Header, Request = values (XML plist).
+std::string mid_body(const PlistDict& request) {
+    PlistDict root;
+    root["Header"]  = PlistValue::makeDict(PlistDict{});
+    root["Request"] = PlistValue::makeDict(request);
+    return encode_plist_xml(root);
+}
+
+// Provisioning headers: identity only — NO X-Apple-I-MD/-M (they don't exist
+// until the machine is provisioned; that's the chicken-and-egg the bag/lookup
+// and this step resolve).
+std::map<std::string, std::string> mid_headers(const std::string& lu, const std::string& dev) {
+    return {
+        {"Accept",            "*/*"},
+        {"Connection",        "close"},
+        {"Content-Type",      "text/x-xml-plist"},
+        {"User-Agent",        ANISETTE_UA},
+        {"X-Apple-I-MD-LU",   lu},
+        {"X-MMe-Client-Info", ANISETTE_CLIENT_INFO},
+        {"X-Mme-Device-Id",   dev},
+    };
+}
+
+PlistDict mid_response(const std::string& body) {
+    PlistDict d = decode_plist(body);
+    if (d.count("Response") && d.at("Response").isDict()) return d.at("Response").dictVal;
+    return d;
+}
+} // namespace
+
+HttpClient& AppStore::gsa_http() {
+    if (!m_gsaHttpReady) {
+        m_gsaHttp.set_ca_bundle(std::string(APPLE_GSA_CA_BUNDLE, APPLE_GSA_CA_BUNDLE_LEN));
+        m_gsaHttp.set_debug(m_debug);
+        m_gsaHttpReady = true;
+    }
+    return m_gsaHttp;
+}
+
+const std::map<std::string, std::string>& AppStore::gsa_bag_all() {
+    if (!m_gsaBagFetched) {                 // one bootstrap lookup per process
+        m_gsaBag        = gsa_fetch_bag(gsa_http(), ANISETTE_CLIENT_INFO, m_debug);
+        m_gsaBagFetched = true;
+    }
+    return m_gsaBag;
+}
+
+std::string AppStore::gsa_bag(const std::string& key) {
+    const auto& bag = gsa_bag_all();
+    auto it = bag.find(key);
+    if (it == bag.end() || it->second.empty())
+        throw IpaError("GSA bag has no URL for '" + key + "'");
+    return it->second;
+}
+
+std::string AppStore::gsa_identity_path() const {
+    return m_adiStatePath.empty() ? std::string() : (m_adiStatePath + ".gsaid");
+}
+
+void AppStore::gsa_load_identity() {
+    if (m_gsaIdentifier.size() == 16) return;   // already in memory
+
+    const std::string path = gsa_identity_path();
+    if (!path.empty()) {
+        std::ifstream in(ipt::fs_path(path));
+        if (in) {
+            std::string idhex;
+            uint64_t    rinfo = 0;
+            std::getline(in, idhex);
+            in >> rinfo;
+            if (idhex.size() == 32) {
+                auto hv = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    return -1;
+                };
+                std::vector<uint8_t> id(16);
+                bool ok = true;
+                for (size_t i = 0; i < 16 && ok; ++i) {
+                    int hi = hv(idhex[i * 2]), lo = hv(idhex[i * 2 + 1]);
+                    if (hi < 0 || lo < 0) { ok = false; break; }
+                    id[i] = static_cast<uint8_t>((hi << 4) | lo);
+                }
+                if (ok) {
+                    m_gsaIdentifier = std::move(id);
+                    m_gsaRinfo      = rinfo;
+                    prov_log("GSA identity loaded (rinfo=" + std::to_string(rinfo) + ")");
+                    return;
+                }
+            }
+        }
+    }
+
+    m_gsaIdentifier.resize(16);
+    secure_random(m_gsaIdentifier.data(), m_gsaIdentifier.size());
+    m_gsaRinfo = 0;
+    prov_log("GSA identity generated (new machine)");
+    gsa_save_identity();
+}
+
+void AppStore::gsa_save_identity() const {
+    const std::string path = gsa_identity_path();
+    if (path.empty() || m_gsaIdentifier.size() != 16) return;
+    std::ofstream out(ipt::fs_path(path), std::ios::trunc);
+    if (!out) { return; }
+    out << gsa_to_hex(m_gsaIdentifier) << "\n" << m_gsaRinfo << "\n";
+}
+
+AnisetteData AppStore::gsa_anisette() {
+    gsa_load_identity();
+
+    int32_t st = 0;
+    auto otp = adi_machine().AdiRequestOTP(kGsaMachineDSID, &st);
+    if (!otp || m_gsaRinfo == 0) {              // unprovisioned, or RINFO lost
+        gsa_provision_machine(kGsaMachineDSID);
+        otp = adi_machine().AdiRequestOTP(kGsaMachineDSID, &st);
+    }
+    if (!otp)
+        throw IpaError("GSA anisette: OTP unavailable (status " + std::to_string(st) + ")");
+    adi_save();   // the OTP counter lives in the ADI state
+
+    auto [lu, dev] = gsa_identity(m_gsaIdentifier);
+    AnisetteData a;
+    a.otp           = SapBase64::Encode(otp->otp);
+    a.machineID     = SapBase64::Encode(otp->machineID);
+    a.localUserUUID = lu;
+    a.routingInfo   = std::to_string(m_gsaRinfo);
+    a.deviceID      = dev;
+    a.clientInfo    = ANISETTE_CLIENT_INFO;
+    a.serialNo      = make_fserial(get_guid());   // per-machine base64 serial (unique,
+                                                  // unlike the shared "0" software cohort)
+    a.clientTime    = "";           // GsaClient stamps ISO-8601 when empty
+    a.locale        = "en_US";
+    a.timezone      = "UTC";
+    return a;
+}
+
+void AppStore::gsa_provision_machine(uint64_t dsid) {
+    gsa_load_identity();
+    auto [lu, dev]   = gsa_identity(m_gsaIdentifier);
+    HttpClient& http = gsa_http();
+
+    // start → spim
+    prov_log("GSA MidService: start provisioning DSID " + dsid_str(dsid));
+    const std::string startUrl  = gsa_bag("midStartProvisioning");
+    const std::string startBody = mid_body(PlistDict{});
+    const auto        startHdrs = mid_headers(lu, dev);
+    if (m_debug) debug_dump_request("GSA MidService start", "POST", startUrl, startHdrs, startBody);
+    HttpResponse r1 = http.post(startUrl, startBody, startHdrs);
+    if (m_debug) debug_dump_response("GSA MidService start", r1);
+    if (r1.statusCode != 200)
+        throw IpaError("GSA provisioning start: HTTP " + std::to_string(r1.statusCode));
+    PlistDict resp1 = mid_response(r1.body);
+    std::vector<uint8_t> spim = base64_decode(dict_str(resp1, "spim"));
+    if (spim.empty()) throw IpaError("GSA provisioning: missing spim");
+
+    // ADI consumes spim, produces cpim + a session handle
+    auto sr = adi_machine().AdiStartProvisioning(dsid, spim);
+
+    // finish {cpim} → ptm + tk + RINFO
+    PlistDict finReq;
+    finReq["cpim"] = PlistValue::makeString(
+        base64_encode(sr.clientData.data(), sr.clientData.size()));
+    prov_log("GSA MidService: finish provisioning");
+    const std::string finUrl  = gsa_bag("midFinishProvisioning");
+    const std::string finBody = mid_body(finReq);
+    const auto        finHdrs = mid_headers(lu, dev);
+    if (m_debug) debug_dump_request("GSA MidService finish", "POST", finUrl, finHdrs, finBody);
+    HttpResponse r2 = http.post(finUrl, finBody, finHdrs);
+    if (m_debug) debug_dump_response("GSA MidService finish", r2);
+    if (r2.statusCode != 200)
+        throw IpaError("GSA provisioning finish: HTTP " + std::to_string(r2.statusCode));
+    PlistDict resp2 = mid_response(r2.body);
+
+    std::vector<uint8_t> ptm = base64_decode(dict_str(resp2, "ptm"));
+    std::vector<uint8_t> tk  = base64_decode(dict_str(resp2, "tk"));
+    if (ptm.empty() || tk.empty()) throw IpaError("GSA provisioning: missing ptm/tk");
+
+    // RINFO is in the Response body (not a header)
+    try { m_gsaRinfo = std::stoull(dict_str(resp2, "X-Apple-I-MD-RINFO")); }
+    catch (...) { m_gsaRinfo = 0; }
+    if (m_gsaRinfo == 0) throw IpaError("GSA provisioning: bad routing info");
+
+    adi_machine().AdiEndProvisioning(sr.session, ptm, tk);
+    gsa_save_identity();   // persist RINFO beside the seed
+    adi_save();            // persist the ADI state — now carries DSID -2
+    prov_log("GSA provisioning complete (rinfo=" + std::to_string(m_gsaRinfo) + ")");
+}
+
+Account AppStore::login_gsa(const std::string& email,
+                            const std::string& password,
+                            const std::string& authCode,
+                            const GsaClient::CodeProvider& getCode) {
+    // 1. Grand Slam: SRP-6a → PET. gsa_anisette() provisions the -2 machine on
+    //    demand. 2FA is resolved entirely inside the GSA exchange: with a getCode
+    //    provider the whole push → code → validate → PET sequence runs in this one
+    //    call (no redundant SRP); without one GsaClient throws AuthCodeRequired for
+    //    the two-call contract. Unlike the plain native login, GSA tells a wrong
+    //    password apart from a real 2FA prompt (ec -22421/-22406 → IpaError(
+    //    "Incorrect Apple ID or password")), so the user isn't nudged toward a code
+    //    request that would burn an attempt.
+    AnisetteData ani = gsa_anisette();
+    GsaClient gsa(gsa_http(), m_debug);
+    gsa.set_bag(gsa_bag_all());   // share the once-per-process bag (no re-fetch per login_gsa)
+    GsaClient::Result r = gsa.login(email, password, ani, authCode, getCode);
+
+    // 2. Native authenticate with the PET as the password — passed verbatim, it
+    //    already carries Apple's trailing "PET" tag. This is the ordinary native
+    //    sign-in path (bag → SAP signing → reactive store/DSID-1 provisioning →
+    //    X-Token), so reuse it. No 2FA here — the PET is already 2FA-complete, so
+    //    login()/do_login() send it verbatim with no code to append. The PET is
+    //    decrypted from its SecureString only for this call and wiped right after.
+    if (m_debug) prov_log("GSA: PET obtained, running native authenticate");
+    SecureString::Guard pet = r.pet.decrypt();
+    Account acc = login(email, pet.str(), "");
+
+    // do_login stores its `password` argument as acc.password — but here that was the
+    // PET, which lasts ~5 min. A later silent relogin must re-run GSA SRP, which needs
+    // the real Apple ID password, so persist that instead of the throwaway PET.
+    acc.password.set(password);
+    return acc;
+}
