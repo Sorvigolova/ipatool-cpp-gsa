@@ -90,8 +90,10 @@ string iso8601_now() {
     gmtime_r(&now, &t);
 #endif
     char buf[32];
-    snprintf(buf, sizeof buf, "%04d-%02d-%02dT%02d:%02d:%02dZ",
-             t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+    // strftime (not snprintf) formats struct tm directly: correct, and it avoids
+    // the -Wformat-truncation warning GCC raises because it can't prove the tm
+    // fields are small (it assumes full int range → up to 73 bytes).
+    std::strftime(buf, sizeof buf, "%Y-%m-%dT%H:%M:%SZ", &t);
     return buf;
 }
 
