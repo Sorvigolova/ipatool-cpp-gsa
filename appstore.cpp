@@ -9,6 +9,7 @@
 #include <span>
 #include <utility>
 #include <thread>
+#include <mutex>         // serialize PSA MD5 across parallel-download workers
 #include <chrono>
 #include <fstream>
 #include <set>
@@ -235,6 +236,16 @@ static std::string md5_buf_hex(const uint8_t* data, size_t len) {
     unsigned char md[16];
 #if MBEDTLS_VERSION_MAJOR >= 4
     static const psa_status_t initrc = psa_crypto_init(); (void)initrc;  // idempotent
+    // PSA keeps global state (driver dispatch / key store) that mbedTLS guards only
+    // when MBEDTLS_THREADING_C is set. The from-source builds patch that in, but the
+    // vcpkg (MSVC) mbedTLS does NOT — and the parallel chunk downloader calls this
+    // from 4 worker threads at once, which would race on that global state. So
+    // serialize the PSA call ourselves; it makes every build safe regardless of the
+    // mbedTLS threading config. MD5 of one chunk is trivial next to the network
+    // fetch, so the lock costs nothing in practice. (The legacy branch below uses a
+    // local context and is already reentrant, so it needs no lock.)
+    static std::mutex psa_md5_mtx;
+    std::lock_guard<std::mutex> psa_lk(psa_md5_mtx);
     size_t mdlen = 0;
     if (psa_hash_compute(PSA_ALG_MD5, data, len, md, sizeof(md), &mdlen) != PSA_SUCCESS
         || mdlen != sizeof(md))
