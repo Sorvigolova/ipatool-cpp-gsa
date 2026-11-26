@@ -247,12 +247,12 @@ uint32_t StoreAgentMachine::InitializeGlobal(std::span<const uint8_t> hardwareID
     uint64_t pathAddr    = Scratch(scPath.data(), scPath.size());
     uint64_t ctxField    = Scratch(4); // uint32 out-param
 
-    // Signature: FairPlayGlobalContextInit(0, hardwareBlock, scInfoPath, &ctx).
+    // Signature: FairPlayInitContext(0, hardwareBlock, scInfoPath, &ctx).
     // The leading 0 is a real argument (upstream storeagent.go passes it too);
     // dropping it shifts every argument by one register and the call fails
     // with -42023 (the context out-param never gets written).
     int32_t status = static_cast<int32_t>(
-        Invoke(kGlobalInit, { 0ULL, hwAddr, pathAddr, ctxField }));
+        Invoke(FairPlayInitContext, { 0ULL, hwAddr, pathAddr, ctxField }));
 
     uint32_t ctx = GuestRead32(ctxField);
     ClearScratch();
@@ -361,7 +361,7 @@ StoreAgentMachine::AdiStartProvisioning(uint64_t dsid, std::span<const uint8_t> 
     uint64_t lenFld  = Scratch(4);
     uint64_t sessFld = Scratch(4);
 
-    int32_t status = static_cast<int32_t>(Invoke(kAdiStart, {
+    int32_t status = static_cast<int32_t>(Invoke(ADIProvisioningStart, {
         dsid, inAddr, uint64_t(serverData.size()), ptrFld, lenFld, sessFld }));
 
     AdiStartResult r;
@@ -388,7 +388,7 @@ void StoreAgentMachine::AdiEndProvisioning(uint32_t session,
     uint64_t siAddr = Scratch(settingInfo.data(),  settingInfo.size());
     uint64_t tkAddr = Scratch(transportKey.data(), transportKey.size());
 
-    int32_t status = static_cast<int32_t>(Invoke(kAdiEnd, {
+    int32_t status = static_cast<int32_t>(Invoke(ADIProvisioningEnd, {
         uint64_t(session),
         siAddr, uint64_t(settingInfo.size()),
         tkAddr, uint64_t(transportKey.size()) }));
@@ -406,7 +406,7 @@ StoreAgentMachine::AdiRequestOTP(uint64_t dsid, int32_t* statusOut) {
     uint64_t otpPtr = Scratch(8);
     uint64_t otpLen = Scratch(4);
 
-    int32_t status = static_cast<int32_t>(Invoke(kAdiOTP, {
+    int32_t status = static_cast<int32_t>(Invoke(ADIOTPRequest, {
         dsid, midPtr, midLen, otpPtr, otpLen }));
     if (statusOut) *statusOut = status;
 
@@ -423,7 +423,7 @@ StoreAgentMachine::AdiRequestOTP(uint64_t dsid, int32_t* statusOut) {
 
 int32_t StoreAgentMachine::AdiErase(uint64_t dsid) {
     RequireADI();
-    int32_t status = static_cast<int32_t>(Invoke(kAdiErase, { dsid }));
+    int32_t status = static_cast<int32_t>(Invoke(ADIProvisioningErase, { dsid }));
     ClearScratch();
     return status;
 }
@@ -443,7 +443,7 @@ StoreAgentMachine::AdiSynchronize(uint64_t dsid, std::span<const uint8_t> server
     uint64_t cdPtr  = Scratch(8);
     uint64_t cdLen  = Scratch(4);
 
-    int32_t status = static_cast<int32_t>(Invoke(kAdiSync, {
+    int32_t status = static_cast<int32_t>(Invoke(ADISynchronize, {
         dsid, inAddr, uint64_t(serverData.size()), midPtr, midLen, cdPtr, cdLen }));
 
     AdiSyncResult r;
@@ -476,7 +476,7 @@ void StoreAgentMachine::SetSyncState(std::vector<uint8_t> state) {
 int32_t StoreAgentMachine::ImportKeyBag(uint32_t globalCtx, std::span<const uint8_t> keyBag) {
     if (keyBag.empty()) throw std::runtime_error("FairPlay keybag is empty");
     uint64_t kbAddr = Scratch(keyBag.data(), keyBag.size());
-    int32_t status = static_cast<int32_t>(Invoke(kImportKeyBag, {
+    int32_t status = static_cast<int32_t>(Invoke(FairPlayImportKeybagData, {
         uint64_t(globalCtx), kbAddr, uint64_t(keyBag.size()) }));
     ClearScratch();
     return status;
@@ -560,7 +560,7 @@ void StoreAgentMachine::ImportAdiState(std::span<const uint8_t> state) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  KBSyncData — FairPlayKBSyncDataWithDSID (port of sapsigner emulator)
+//  KBSyncData — FairPlayKeybagSyncData (port of sapsigner emulator)
 // ═══════════════════════════════════════════════════════════════════════════
 
 std::vector<uint8_t> StoreAgentMachine::KBSyncData(uint32_t globalCtx, uint64_t dsid) {
@@ -568,16 +568,16 @@ std::vector<uint8_t> StoreAgentMachine::KBSyncData(uint32_t globalCtx, uint64_t 
     uint64_t lenFld = Scratch(8);   // out: uint32 length (zeroed 8 bytes)
 
     int32_t status = static_cast<int32_t>(
-        Invoke(kKBSyncData, { uint64_t(globalCtx), dsid, 0ULL, 1ULL, ptrFld, lenFld }));
+        Invoke(FairPlayKeybagSyncData, { uint64_t(globalCtx), dsid, 0ULL, 1ULL, ptrFld, lenFld }));
 
     uint64_t ptr = GuestRead64(ptrFld);
     uint32_t len = GuestRead32(lenFld);
     ClearScratch();
 
     if (status != 0)
-        throw std::runtime_error(ipt::format("FairPlayKBSyncDataWithDSID returned {}", status));
+        throw std::runtime_error(ipt::format("FairPlayKeybagSyncData returned {}", status));
     if (!ptr || !len)
-        throw std::runtime_error("FairPlayKBSyncDataWithDSID returned an empty buffer");
+        throw std::runtime_error("FairPlayKeybagSyncData returned an empty buffer");
 
     std::vector<uint8_t> out(len);
     UCK(uc_mem_read(uc_, ptr, out.data(), len), "read kbsync");

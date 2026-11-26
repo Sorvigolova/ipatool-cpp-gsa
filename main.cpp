@@ -1127,7 +1127,7 @@ static void cmd_get_version_metadata(const Args& args) {
 }
 
 // Test command: obtain the kbsync blob and print it, to check the FairPlay
-// emulation (storeagent GlobalContextInit + KBSyncDataWithDSID). No request is
+// emulation (storeagent FairPlayInitContext + FairPlayKeybagSyncData). No request is
 // sent to Apple.
 //
 // Caching: for the saved account's DSID, the blob is cached in the account file

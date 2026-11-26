@@ -59,7 +59,7 @@ public:
     // Close the session.
     void CloseSession(uint64_t session);
 
-    // kbsync blob for an account DSID — FairPlayKBSyncDataWithDSID, the
+    // kbsync blob for an account DSID — FairPlayKeybagSyncData, the
     // storeagent function behind -[… _kbSyncDataWithDSID:]. Takes the context
     // from InitializeGlobal(); no keybag in "SC Info" is needed.
     std::vector<uint8_t> KBSyncData(uint32_t globalCtx, uint64_t dsid);
@@ -145,15 +145,15 @@ private:
     static constexpr uint64_t kPageSize     = 0x1000;
 
     // ── entry points (hardcoded offsets from storeagent.go) ──────────────────
-    static constexpr uint64_t kGlobalInit   = kAgentBase + 0x0c5fc0;
+    static constexpr uint64_t FairPlayInitContext     = kAgentBase + 0x0c5fc0; // _XtCqEf5X
     static constexpr uint64_t kSessionInit  = kAgentBase + 0x0debd0;
     static constexpr uint64_t kDecryptEntry = kAgentBase + 0x0ee700;
     static constexpr uint64_t kSessionClose = kAgentBase + 0x1212d0;
     // (ctx, dsid, 0, 1, &outPtr, &outLen) -> 0 on success
-    static constexpr uint64_t kKBSyncData   = kAgentBase + 0x0c93c0;
+    static constexpr uint64_t FairPlayKeybagSyncData   = kAgentBase + 0x0c93c0; // _Mt76Vq80ux
     // (globalCtx, keybag, len) — FairPlay keybag import used by
     // -[ADIProvisioningOperation run] ("Imported FP keybag from machine provisioning")
-    static constexpr uint64_t kImportKeyBag = kAgentBase + 0x0d5ce0;
+    static constexpr uint64_t FairPlayImportKeybagData = kAgentBase + 0x0d5ce0; // _ha0dkchaters6
 
     // ADI wrappers (storeagent 10.9, Pisa-215.1), all return int32 status:
     //   start (u64 dsid, u8* spim, u32 len, u8** cpim, u32* cpimLen, u32* session)
@@ -162,11 +162,11 @@ private:
     //   erase (u64 dsid)
     //   sync  (u64 dsid, u8* sim, u32 len, u8** machineId, u32* len,
     //          u8** clientData, u32* len)  — 7th argument on the stack
-    static constexpr uint64_t kAdiStart     = kAgentBase + 0x1a8cf0;
-    static constexpr uint64_t kAdiEnd       = kAgentBase + 0x1a9880;
-    static constexpr uint64_t kAdiOTP       = kAgentBase + 0x1aa100;
-    static constexpr uint64_t kAdiErase     = kAgentBase + 0x1aed40;
-    static constexpr uint64_t kAdiSync      = kAgentBase + 0x1ab240;
+    static constexpr uint64_t ADIProvisioningStart = kAgentBase + 0x1a8cf0; // _rsegvyrt87
+    static constexpr uint64_t ADIProvisioningEnd   = kAgentBase + 0x1a9880; // _uv5t6nhkui
+    static constexpr uint64_t ADIOTPRequest        = kAgentBase + 0x1aa100; // _qi864985u0
+    static constexpr uint64_t ADIProvisioningErase = kAgentBase + 0x1aed40; // _p435tmhbla
+    static constexpr uint64_t ADISynchronize       = kAgentBase + 0x1ab240; // _tn46gtiuhw
     // Host-side slot for syncState inside the virtual-file map (not under a
     // virtual root, so guest code never sees it).
     static constexpr const char* kSyncStatePath = "/ipatool/adi-sync-state";

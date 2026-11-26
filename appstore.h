@@ -175,7 +175,7 @@ public:
 
     // ── kbsync ────────────────────────────────────────────────────────────────
     // Generates the kbsync blob for an account DSID by running storeagent's
-    // FairPlayGlobalContextInit + FairPlayKBSyncDataWithDSID under the
+    // FairPlayInitContext + FairPlayKeybagSyncData under the
     // emulator. Local only — no request is sent to Apple. Throws on failure.
     std::vector<uint8_t> generate_kbsync(uint64_t dsid);
 
@@ -275,7 +275,7 @@ private:
     const std::map<std::string, std::string>& gsa_bag_all();  // fetch-once, return whole bag
     std::string gsa_bag(const std::string& key);
 
-    // Lazy FairPlayGlobalContextInit on m_adi — the slow part (~15-20 s under
+    // Lazy FairPlayInitContext on m_adi — the slow part (~15-20 s under
     // Unicorn). Only kbsync and the keybag import need the context; OTP
     // generation (X-Apple-MD headers) and erase do not, so they never pay for it.
     // IPATOOL_ADI_EAGER_FP=1 restores the old behaviour (init right at creation).
