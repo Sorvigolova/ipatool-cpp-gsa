@@ -263,11 +263,11 @@ private:
 
     // ── SAP CommerceKit entry points ──────────────────────────────────────────
     struct EntryPoints {
-        uint64_t initialize = 0; // _cp2g1b9ro
-        uint64_t exchange   = 0; // _Mib5yocT
-        uint64_t sign       = 0; // _Fc3vhtJDvr
-        uint64_t teardown   = 0; // _IPaI1oem5iL
-        uint64_t dispose    = 0; // _jEHf8Xzsv8K
+        uint64_t FairPlaySAPInit        = 0; // _cp2g1b9ro
+        uint64_t FairPlaySAPExchange    = 0; // _Mib5yocT
+        uint64_t FairPlaySAPSign        = 0; // _Fc3vhtJDvr
+        uint64_t FairPlaySAPTeardown    = 0; // _IPaI1oem5iL
+        uint64_t FairPlayDisposeStorage = 0; // _jEHf8Xzsv8K
     } entry_;
 
     // ── invoke helpers ────────────────────────────────────────────────────────

@@ -1004,11 +1004,11 @@ std::unique_ptr<SapMachine> SapMachine::Create(
     imgCommerceKit ->Load(m->uc_);
 
     // 9. Resolve CommerceKit entry points
-    m->entry_.initialize = imgCommerceKit->Export("_cp2g1b9ro",   kKitBase);
-    m->entry_.exchange   = imgCommerceKit->Export("_Mib5yocT",    kKitBase);
-    m->entry_.sign       = imgCommerceKit->Export("_Fc3vhtJDvr",  kKitBase);
-    m->entry_.teardown   = imgCommerceKit->Export("_IPaI1oem5iL", kKitBase);
-    m->entry_.dispose    = imgCommerceKit->Export("_jEHf8Xzsv8K", kKitBase);
+    m->entry_.FairPlaySAPInit        = imgCommerceKit->Export("_cp2g1b9ro",   kKitBase);
+    m->entry_.FairPlaySAPExchange    = imgCommerceKit->Export("_Mib5yocT",    kKitBase);
+    m->entry_.FairPlaySAPSign        = imgCommerceKit->Export("_Fc3vhtJDvr",  kKitBase);
+    m->entry_.FairPlaySAPTeardown    = imgCommerceKit->Export("_IPaI1oem5iL", kKitBase);
+    m->entry_.FairPlayDisposeStorage = imgCommerceKit->Export("_jEHf8Xzsv8K", kKitBase);
 
     return m;
 }
@@ -1134,7 +1134,7 @@ std::vector<uint8_t> SapMachine::ConsumeOutput(uint64_t ptrFld, uint64_t lenFld)
         UC_CHECK(uc_mem_read(uc_, ptr, out.data(), len), "read output");
     }
     if (ptr) {
-        int32_t st = static_cast<int32_t>(Invoke(entry_.dispose, { ptr }));
+        int32_t st = static_cast<int32_t>(Invoke(entry_.FairPlayDisposeStorage, { ptr }));
         (void)st; // non-fatal if dispose fails
     }
     return out;
@@ -1145,7 +1145,7 @@ uint64_t SapMachine::Initialize(std::span<const uint8_t> hwID) {
     BeginCall();
     uint64_t ctxFld = Scratch(8);
     uint64_t hwAddr = Scratch(hw.data(), hw.size());
-    int32_t  status = static_cast<int32_t>(Invoke(entry_.initialize, { ctxFld, hwAddr }));
+    int32_t  status = static_cast<int32_t>(Invoke(entry_.FairPlaySAPInit, { ctxFld, hwAddr }));
     uint64_t ctx    = GuestRead64(ctxFld);
     ClearScratch();
     if (status != 0) throw std::runtime_error(ipt::format("Initialize returned {}", status));
@@ -1164,7 +1164,7 @@ SapMachine::Exchange(uint32_t version, std::span<const uint8_t> hwID,
     uint64_t outLenFld = Scratch(8);
     uint64_t resFld    = Scratch(4);
 
-    int32_t status = static_cast<int32_t>(Invoke(entry_.exchange, {
+    int32_t status = static_cast<int32_t>(Invoke(entry_.FairPlaySAPExchange, {
         uint64_t(version), hwAddr, ctx,
         inAddr, uint64_t(input.size()),
         outPtrFld, outLenFld, resFld
@@ -1183,7 +1183,7 @@ std::vector<uint8_t> SapMachine::Sign(uint64_t ctx, std::span<const uint8_t> inp
     uint64_t outPtrFld = Scratch(8);
     uint64_t outLenFld = Scratch(8);
 
-    int32_t status = static_cast<int32_t>(Invoke(entry_.sign, {
+    int32_t status = static_cast<int32_t>(Invoke(entry_.FairPlaySAPSign, {
         ctx, inAddr, uint64_t(input.size()), outPtrFld, outLenFld
     }));
     if (status != 0) { ClearScratch(); throw std::runtime_error(ipt::format("Sign returned {}", status)); }
@@ -1196,7 +1196,7 @@ std::vector<uint8_t> SapMachine::Sign(uint64_t ctx, std::span<const uint8_t> inp
 
 void SapMachine::Teardown(uint64_t ctx) {
     BeginCall();
-    int32_t st = static_cast<int32_t>(Invoke(entry_.teardown, { ctx }));
+    int32_t st = static_cast<int32_t>(Invoke(entry_.FairPlaySAPTeardown, { ctx }));
     ClearScratch();
     if (st != 0) throw std::runtime_error(ipt::format("Teardown returned {}", st));
 }
